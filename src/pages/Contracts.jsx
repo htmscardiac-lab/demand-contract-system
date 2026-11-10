@@ -301,6 +301,33 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
     e.target.value = ''
   }
 
+  // Empty Excel sheet with the columns in the order the upload expects.
+  const downloadTemplate = async () => {
+    const XLSX = await import('xlsx')
+    const cols = ['Line Number', 'Description', 'Part Number', 'Unit Price', 'Model', 'VAT (Yes/No)']
+    const sheet = XLSX.utils.aoa_to_sheet([cols])
+    sheet['!cols'] = [{ wch: 13 }, { wch: 46 }, { wch: 20 }, { wch: 14 }, { wch: 24 }, { wch: 14 }]
+    const help = XLSX.utils.aoa_to_sheet([
+      ['How to fill the "Line items" sheet'],
+      [],
+      ['Column', 'Required', 'What to enter', 'Example'],
+      ['Line Number', 'Yes', 'The line number from the contract. Each number once per contract.', 1],
+      ['Description', 'Yes', 'Part description as written in the contract.', 'Flow sensor, Infinity ID'],
+      ['Part Number', 'Yes', 'Vendor part number.', '8403735'],
+      ['Unit Price', 'Yes', 'Price of one unit, numbers only.', 1450],
+      ['Model', 'No', 'Device model the part belongs to. It is filled in automatically on requests.', 'Evita V500'],
+      ['VAT (Yes/No)', 'No', 'Yes if VAT applies to the part, No if it does not. Empty counts as No.', 'Yes'],
+      [],
+      ['Keep the first row (the column titles) and do not change the column order.'],
+      ['Start typing from row 2, one part per row. Only the first sheet is read.'],
+    ])
+    help['!cols'] = [{ wch: 16 }, { wch: 10 }, { wch: 74 }, { wch: 26 }]
+    const wb = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(wb, sheet, 'Line items')
+    XLSX.utils.book_append_sheet(wb, help, 'How to fill')
+    XLSX.writeFile(wb, 'contract-line-items-template.xlsx')
+  }
+
   const importExcel = async () => {
     setBusy(true); setErr('')
     const { error } = await supabase.from('contract_items').insert(excelRows.map(r => ({ ...r, contract_id: contract.id })))
@@ -372,15 +399,16 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
       )}
 
       <Card className="overflow-hidden">
-        <SectionHead title={`Line items · ${items.length}`} hint={canEdit ? 'Excel columns in order: line number, description, part number, unit price, model, VAT (Yes or No).' : undefined}
-          right={canEdit && <div className="flex gap-2">
+        <SectionHead title={`Line items · ${items.length}`} hint={canEdit ? 'Download the Excel template, fill one part per row, then upload it.' : undefined}
+          right={canEdit && <div className="flex flex-wrap gap-2">
+            <Btn variant="ghost" icon="download" onClick={downloadTemplate}>Excel template</Btn>
             <label className="inline-flex items-center justify-center gap-2 h-9.5 px-4 rounded-lg text-sm font-medium bg-white hover:bg-ink-50 text-ink-800 border border-ink-300 cursor-pointer transition-colors">
               <Icon name="upload" className="w-4 h-4" />Upload Excel
               <input type="file" accept=".xlsx,.xls,.csv" className="sr-only" onChange={onExcel} />
             </label>
             <Btn icon="plus" onClick={() => setShowAdd(true)}>Add line item</Btn>
           </div>} />
-        {items.length === 0 ? <Empty icon="box" title="No line items yet" hint="Upload the contract's Excel sheet or add line items one by one." /> : (
+        {items.length === 0 ? <Empty icon="box" title="No line items yet" hint="Download the Excel template, fill it and upload it, or add line items one by one." /> : (
           <TableWrap>
             <thead><tr><Th className="w-16">Line</Th><Th className="w-16">Image</Th><Th>Description</Th><Th>Part number</Th><Th>Model</Th><Th>VAT</Th><Th right>Unit price</Th>{canEdit && <Th></Th>}</tr></thead>
             <tbody>
