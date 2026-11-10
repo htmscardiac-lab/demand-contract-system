@@ -3,25 +3,42 @@ export const fmtDate = (d) => d ? new Date(d).toLocaleDateString('en-GB', { day:
 export const fmtDateTime = (d) => d ? new Date(d).toLocaleString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'
 
 export const STATUS_LABEL = {
-  pending: 'Pending — supervisor',
-  pending_clinical: 'At clinical engineer',
+  pending: 'Awaiting supervisor',
+  pending_clinical: 'Awaiting clinical engineer',
   in_process: 'In process',
   approved: 'Approved',
-  returned: 'Returned',
+  returned: 'Returned for amendment',
   rejected: 'Rejected',
   cancelled: 'Cancelled',
   closed: 'Closed',
 }
 export const STATUS_STYLE = {
-  pending:          'bg-amber-100 text-amber-800',
-  pending_clinical: 'bg-indigo-100 text-indigo-800',
-  in_process:       'bg-blue-100 text-blue-800',
-  approved:         'bg-emerald-100 text-emerald-800',
-  returned:         'bg-orange-100 text-orange-800',
-  rejected:         'bg-red-100 text-red-700',
-  cancelled:        'bg-slate-200 text-slate-500',
-  closed:           'bg-slate-200 text-slate-700',
+  pending:          'bg-amber-100 text-amber-700',
+  pending_clinical: 'bg-gold-100 text-gold-700',
+  in_process:       'bg-steel-100 text-steel-700',
+  approved:         'bg-olive-100 text-olive-700',
+  returned:         'bg-brand-100 text-brand-700',
+  rejected:         'bg-brand-600 text-white',
+  cancelled:        'bg-ink-100 text-ink-500',
+  closed:           'bg-ink-900 text-white',
 }
+export const ACTIVE_STATUSES = ['pending', 'pending_clinical', 'in_process', 'approved', 'returned']
+export const DONE_STATUSES = ['closed', 'rejected', 'cancelled']
+
+// What the signed-in user has to do with a request right now (null = nothing).
+export function actionFor(r, profile) {
+  if (!r || !profile || r.archived) return null
+  const admin = profile.role === 'admin'
+  if (r.status === 'pending' && (admin || r.supervisor_id === profile.id)) return 'Review and decide'
+  if (r.status === 'pending_clinical' && (admin || profile.role === 'clinical_engineer')) return 'Issue release'
+  if (r.status === 'returned' && r.engineer_id === profile.id) return 'Amend and resubmit'
+  return null
+}
+export const requestTotal = (r) => (r.request_items || []).reduce((s, i) => s + i.unit_price * i.quantity, 0)
+export const isOverdue = (r) => ['in_process', 'approved'].includes(r.status) && r.promise_date
+  && new Date(r.promise_date) < new Date(new Date().toDateString())
+  && (r.request_items || []).some(i => (i.received_quantity || 0) < i.quantity)
+export const ROLE_LABEL = { engineer: 'Engineer', supervisor: 'Supervisor', clinical_engineer: 'Clinical engineer', admin: 'Administrator' }
 export const statusLabel = (s) => STATUS_LABEL[s] || s
 export const receiptLabel = (it) =>
   it.received_quantity >= it.quantity ? 'Received'
@@ -41,7 +58,7 @@ export function buildTimeline(r) {
   const stages = [
     { key: 'submitted', label: 'Submitted', at: r.submitted_at, desc: `by ${r.engineer?.full_name || ''}` },
     ...(supervisorMade ? [] : [{ key: 'supervisor', label: 'Supervisor approval', at: r.decided_at, desc: r.supervisor?.full_name || '' }]),
-    { key: 'clinical', label: 'At clinical engineer', at: null, desc: 'procurement processing' },
+    { key: 'clinical', label: 'Clinical engineer', at: null, desc: 'procurement processing' },
     { key: 'in_process', label: 'In process', at: null, desc: r.release_number ? `Release ${r.release_number}` : 'release issued' },
     { key: 'approved', label: 'Approved', at: null, desc: 'release approved' },
     { key: 'receiving', label: 'Receiving parts', at: null, desc: 'goods receipt' },

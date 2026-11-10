@@ -1,2 +1,76 @@
 @import "tailwindcss";
+
+/* Identity: Ministry of National Guard Health Affairs — crimson crescent,
+   black banner, gold crown, olive wreath. HTMS mark — black + red ECG trace. */
+@theme {
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+  --font-display: "IBM Plex Sans Condensed", "IBM Plex Sans", ui-sans-serif, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+
+  --color-ink-950: #0b0d10;
+  --color-ink-900: #14171c;
+  --color-ink-800: #1d2128;
+  --color-ink-700: #2a2f38;
+  --color-ink-600: #454c58;
+  --color-ink-500: #667080;
+  --color-ink-400: #8e96a3;
+  --color-ink-300: #bfc5ce;
+  --color-ink-200: #dfe3e8;
+  --color-ink-100: #eceef2;
+  --color-ink-50:  #f5f6f8;
+
+  --color-brand-800: #6f0c1b;
+  --color-brand-700: #8f1023;
+  --color-brand-600: #b0142a;
+  --color-brand-500: #c9253a;
+  --color-brand-200: #f1c4ca;
+  --color-brand-100: #f9e4e7;
+  --color-brand-50:  #fdf3f4;
+
+  --color-gold-700: #7d6222;
+  --color-gold-600: #9a7a2c;
+  --color-gold-500: #b8963e;
+  --color-gold-200: #ead9ab;
+  --color-gold-100: #f6eed8;
+
+  --color-olive-700: #2f5e2c;
+  --color-olive-600: #3c7a37;
+  --color-olive-500: #4f9548;
+  --color-olive-100: #e3f0e1;
+  --color-olive-50:  #f1f8f0;
+
+  --color-steel-700: #24507c;
+  --color-steel-600: #2f679d;
+  --color-steel-100: #e1ecf7;
+
+  --color-amber-700: #96600b;
+  --color-amber-100: #fbefd5;
+
+  --shadow-card: 0 1px 2px rgb(20 23 28 / 0.05), 0 1px 1px rgb(20 23 28 / 0.03);
+  --shadow-pop: 0 12px 32px -8px rgb(20 23 28 / 0.22), 0 2px 6px rgb(20 23 28 / 0.08);
+
+  --animate-rise: rise 0.22s ease-out both;
+  --animate-slide: slide 0.24s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  --animate-trace: trace 2.6s ease-out both;
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  @keyframes slide { from { opacity: 0.4; transform: translateX(28px); } to { opacity: 1; transform: none; } }
+  @keyframes trace { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+}
+
 html { -webkit-text-size-adjust: 100%; }
+body {
+  font-family: var(--font-sans);
+  color: var(--color-ink-900);
+  background: var(--color-ink-50);
+  font-feature-settings: "tnum" 0;
+  -webkit-font-smoothing: antialiased;
+}
+.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+:focus-visible { outline: 2px solid var(--color-brand-600); outline-offset: 2px; border-radius: 4px; }
+button, [role="button"], label[for], select, summary { cursor: pointer; }
+button:disabled { cursor: not-allowed; }
+::selection { background: var(--color-brand-100); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}

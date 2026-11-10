@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { supabase } from '../lib/supabase'
-import { Card, Spinner, Empty, PageTitle, TableWrap, Th, Td, Badge } from '../ui.jsx'
-import { money, fmtDate } from '../lib/helpers'
+import { Card, SectionHead, Spinner, Empty, PageTitle, TableWrap, Th, Td, Badge, Meter, Stat } from '../ui.jsx'
+import { money, fmtDate, isOverdue } from '../lib/helpers'
 
 export default function Reports() {
   const [data, setData] = useState(null)
@@ -51,33 +51,45 @@ export default function Reports() {
   const apprRows = Object.entries(approvals).map(([n, v]) => ({ n, avg: v.total / v.count, count: v.count }))
 
   // overdue with no receipt
-  const overdue = reqs.filter(r => r.status === 'approved' && r.promise_date && new Date(r.promise_date) < new Date()
-    && r.request_items.some(i => !i.received_at))
+  const overdue = reqs.filter(r => !r.archived && isOverdue(r))
 
   const fmtHrs = h => h < 48 ? `${h.toFixed(1)} h` : `${(h / 24).toFixed(1)} days`
 
-  return (
-    <div className="space-y-5">
-      <PageTitle>Reports &amp; analytics</PageTitle>
+  const totalValue = bals.reduce((s, b) => s + Number(b.total_amount), 0)
+  const totalRemaining = bals.reduce((s, b) => s + Number(b.remaining), 0)
+  const totalSpent = vendorRows.reduce((s, v) => s + v[1], 0)
+  const compact = (n) => Number(n).toLocaleString('en-US', { notation: 'compact', maximumFractionDigits: 1 })
 
-      <Card className="p-4">
-        <h2 className="font-semibold mb-3">Remaining balance per contract</h2>
-        {bals.length === 0 ? <Empty text="No contracts." /> : (
+  return (
+    <div className="space-y-6">
+      <PageTitle subtitle="Balances, spend and turnaround across all contracts you can see.">Reports</PageTitle>
+
+      <div className="grid grid-cols-2 xl:grid-cols-4 gap-3 sm:gap-4">
+        <Stat label="Contracts" value={contracts.length} hint={`${compact(totalValue)} total value`} />
+        <Stat label="Remaining balance" value={compact(totalRemaining)} tone="olive" hint={totalValue ? `${Math.round(totalRemaining / totalValue * 100)}% of total value` : undefined} />
+        <Stat label="Approved spend" value={compact(totalSpent)} hint="Approved and closed requests" />
+        <Stat label="Overdue deliveries" value={overdue.length} tone={overdue.length ? 'brand' : 'ink'} hint="Past the vendor promise date" />
+      </div>
+
+      <Card className="overflow-hidden">
+        <SectionHead title="Balance by contract" />
+        {bals.length === 0 ? <Empty icon="contracts" title="No contracts yet" /> : (
           <TableWrap>
-            <thead><tr><Th>Contract</Th><Th>Vendor</Th><Th>Total</Th><Th>Prev. consumed</Th><Th>Approved spend</Th><Th>Remaining</Th><Th>End date</Th></tr></thead>
+            <thead><tr><Th>Contract</Th><Th>Vendor</Th><Th right>Total</Th><Th right>Previously consumed</Th><Th right>Committed</Th><Th right>Remaining</Th><Th className="w-40">Balance left</Th><Th>End date</Th></tr></thead>
             <tbody>
               {bals.map(b => {
                 const c = cById[b.contract_id]
-                const low = Number(b.remaining) <= 0.1 * Number(b.total_amount)
+                const pct = Number(b.total_amount) > 0 ? Number(b.remaining) / Number(b.total_amount) * 100 : 0
                 return (
                   <tr key={b.contract_id}>
-                    <Td className="font-medium">{c?.contract_number}</Td>
+                    <Td className="font-medium text-ink-900">{c?.contract_number}</Td>
                     <Td>{c?.vendors?.name}</Td>
-                    <Td>{money(b.total_amount)}</Td>
-                    <Td>{money(b.previous_consumed_amount)}</Td>
-                    <Td>{money(b.approved_spend)}</Td>
-                    <Td className={low ? 'text-red-600 font-bold' : 'font-semibold text-emerald-700'}>{money(b.remaining)}</Td>
-                    <Td>{fmtDate(c?.end_date)}</Td>
+                    <Td right className="num">{money(b.total_amount)}</Td>
+                    <Td right className="num text-ink-600">{money(b.previous_consumed_amount)}</Td>
+                    <Td right className="num text-ink-600">{money(b.approved_spend)}</Td>
+                    <Td right className={`num font-medium ${pct <= 10 ? 'text-brand-600' : 'text-ink-900'}`}>{money(b.remaining)}</Td>
+                    <Td><div className="flex items-center gap-3"><Meter pct={pct} className="flex-1" /><span className="num text-[12px] text-ink-600 w-9 text-right">{Math.round(pct)}%</span></div></Td>
+                    <Td className="text-[13px]">{fmtDate(c?.end_date)}</Td>
                   </tr>
                 )
               })}
@@ -86,48 +98,29 @@ export default function Reports() {
         )}
       </Card>
 
-      <Card className="p-4">
-        <h2 className="font-semibold mb-3">Total spend per vendor <span className="text-xs font-normal text-slate-400">(approved + closed requests)</span></h2>
-        {vendorRows.length === 0 ? <Empty text="No approved spend yet." /> : (
-          <div className="space-y-2">
-            {vendorRows.map(([name, amt]) => (
-              <div key={name}>
-                <div className="flex justify-between text-sm mb-0.5"><span>{name}</span><b>{money(amt)}</b></div>
-                <div className="h-2.5 bg-slate-100 rounded-full overflow-hidden">
-                  <div className="h-full bg-blue-500 rounded-full" style={{ width: (amt / maxSpend * 100) + '%' }} />
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </Card>
-
-      <div className="grid lg:grid-cols-2 gap-5">
-        <Card className="p-4">
-          <h2 className="font-semibold mb-3">Most requested parts</h2>
-          {partRows.length === 0 ? <Empty text="No requests yet." /> : (
-            <TableWrap>
-              <thead><tr><Th>Part</Th><Th>Times requested</Th><Th>Total qty</Th></tr></thead>
-              <tbody>
-                {partRows.map(p => (
-                  <tr key={p.part}>
-                    <Td><div className="font-mono text-xs">{p.part}</div><div className="text-xs text-slate-500 max-w-[200px]">{p.desc}</div></Td>
-                    <Td>{p.count}</Td><Td className="font-semibold">{p.qty}</Td>
-                  </tr>
-                ))}
-              </tbody>
-            </TableWrap>
+      <div className="grid lg:grid-cols-2 gap-6 items-start">
+        <Card className="overflow-hidden">
+          <SectionHead title="Spend by vendor" hint="Approved and closed requests" />
+          {vendorRows.length === 0 ? <Empty icon="reports" title="No approved spend yet" /> : (
+            <ul className="p-5 space-y-4">
+              {vendorRows.map(([name, amt]) => (
+                <li key={name}>
+                  <div className="flex justify-between gap-3 text-sm mb-1.5"><span className="text-ink-900 truncate">{name}</span><span className="num font-medium text-ink-900">{money(amt)}</span></div>
+                  <div className="h-2 bg-ink-100 rounded-full overflow-hidden"><div className="h-full bg-ink-900 rounded-full" style={{ width: (amt / maxSpend * 100) + '%' }} /></div>
+                </li>
+              ))}
+            </ul>
           )}
         </Card>
 
-        <Card className="p-4">
-          <h2 className="font-semibold mb-3">Average approval time per supervisor</h2>
-          {apprRows.length === 0 ? <Empty text="No decided requests yet." /> : (
+        <Card className="overflow-hidden">
+          <SectionHead title="Supervisor turnaround" hint="Average time from submission to decision" />
+          {apprRows.length === 0 ? <Empty icon="clock" title="No decided requests yet" /> : (
             <TableWrap>
-              <thead><tr><Th>Supervisor</Th><Th>Avg. time to decision</Th><Th>Decided</Th></tr></thead>
+              <thead><tr><Th>Supervisor</Th><Th right>Average time</Th><Th right>Decided</Th></tr></thead>
               <tbody>
                 {apprRows.map(a => (
-                  <tr key={a.n}><Td>{a.n}</Td><Td className="font-semibold">{fmtHrs(a.avg)}</Td><Td>{a.count}</Td></tr>
+                  <tr key={a.n}><Td className="text-ink-900">{a.n}</Td><Td right className="num font-medium text-ink-900">{fmtHrs(a.avg)}</Td><Td right className="num">{a.count}</Td></tr>
                 ))}
               </tbody>
             </TableWrap>
@@ -135,19 +128,37 @@ export default function Reports() {
         </Card>
       </div>
 
-      <Card className="p-4">
-        <h2 className="font-semibold mb-3">Overdue vs promise date (no receipt logged)</h2>
-        {overdue.length === 0 ? <Empty text="Nothing overdue. 🎉" /> : (
+      <Card className="overflow-hidden">
+        <SectionHead title="Most requested parts" hint="Top 15 by quantity" />
+        {partRows.length === 0 ? <Empty icon="box" title="No requests yet" /> : (
           <TableWrap>
-            <thead><tr><Th>Request</Th><Th>Contract</Th><Th>Promise date</Th><Th>Last follow-up</Th><Th>Pending items</Th></tr></thead>
+            <thead><tr><Th>Part number</Th><Th>Description</Th><Th right>Times requested</Th><Th right>Total quantity</Th></tr></thead>
+            <tbody>
+              {partRows.map(p => (
+                <tr key={p.part}>
+                  <Td className="num text-[13px] text-ink-900">{p.part}</Td>
+                  <Td className="max-w-[420px]">{p.desc}</Td>
+                  <Td right className="num">{p.count}</Td><Td right className="num font-medium text-ink-900">{p.qty}</Td>
+                </tr>
+              ))}
+            </tbody>
+          </TableWrap>
+        )}
+      </Card>
+
+      <Card className="overflow-hidden">
+        <SectionHead title="Overdue deliveries" hint="Promise date has passed and parts are still outstanding" />
+        {overdue.length === 0 ? <Empty icon="check" title="Nothing is overdue" /> : (
+          <TableWrap>
+            <thead><tr><Th>Request</Th><Th>Contract</Th><Th>Promise date</Th><Th>Last follow-up</Th><Th>Outstanding</Th></tr></thead>
             <tbody>
               {overdue.map(r => (
                 <tr key={r.id}>
-                  <Td className="font-medium">{r.request_number}</Td>
+                  <Td className="num font-medium text-ink-900">{r.request_number}</Td>
                   <Td>{r.contracts?.contract_number}</Td>
-                  <Td className="text-red-600 font-semibold">{fmtDate(r.promise_date)}</Td>
+                  <Td className="text-brand-700 font-medium">{fmtDate(r.promise_date)}</Td>
                   <Td>{fmtDate(r.last_followup_date)}</Td>
-                  <Td><Badge className="bg-red-100 text-red-700">{r.request_items.filter(i => !i.received_at).length} not received</Badge></Td>
+                  <Td><Badge className="bg-brand-100 text-brand-700">{r.request_items.filter(i => (i.received_quantity || 0) < i.quantity).length} lines outstanding</Badge></Td>
                 </tr>
               ))}
             </tbody>
