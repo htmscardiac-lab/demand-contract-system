@@ -61,7 +61,7 @@ export default function NewRequest() {
       setCart((req.request_items || []).filter(it => byId[it.contract_item_id]).map(it => ({
         item: byId[it.contract_item_id], quantity: it.quantity,
         htm: it.htm_number, serial: it.serial_number, wo: it.work_order_number,
-        equip: it.equipment_description || '', model: it.device_model || '',
+        equip: it.equipment_description || '', model: byId[it.contract_item_id].device_model || it.device_model || '',
       })))
       setStep('review')
     })()
@@ -96,7 +96,7 @@ export default function NewRequest() {
     setCart(c => {
       const ex = c.find(x => x.item.id === item.id)
       if (ex) return c.map(x => x.item.id === item.id ? { ...x, quantity: x.quantity + 1 } : x)
-      return [...c, { item, quantity: 1, htm: '', serial: '', wo: '', equip: '', model: '' }]
+      return [...c, { item, quantity: 1, htm: '', serial: '', wo: '', equip: '', model: item.device_model || '' }]
     })
   }
   const setLine = (id, patch) => setCart(c => c.map(x => x.item.id === id ? { ...x, ...patch } : x))
@@ -288,7 +288,11 @@ export default function NewRequest() {
                   : <div className="w-full h-32 bg-ink-100 flex items-center justify-center text-ink-300 border-b border-ink-100"><Icon name="box" className="w-7 h-7" strokeWidth={1.3} /></div>}
                 <div className="p-3.5 flex flex-col flex-1">
                   <div className="num text-[11px] text-ink-500">Line {it.line_number} · {it.part_number}</div>
-                  <div className="text-sm font-medium text-ink-900 leading-snug mt-1 flex-1">{it.description}</div>
+                  <div className="text-sm font-medium text-ink-900 leading-snug mt-1">{it.description}</div>
+                  <div className="flex flex-wrap items-center gap-2 text-[12px] text-ink-500 mt-1 flex-1 content-start">
+                    {it.device_model && <span>{it.device_model}</span>}
+                    {!!it.taxable && <Badge className="bg-gold-100 text-gold-700">VAT</Badge>}
+                  </div>
                   <div className="flex items-center justify-between gap-2 mt-3">
                     <span className="num text-sm font-medium text-ink-900">{money(it.unit_price)}</span>
                     {inCart && <Badge className="bg-ink-900 text-white num">× {inCart.quantity}</Badge>}
@@ -332,6 +336,7 @@ export default function NewRequest() {
               <div className="min-w-0">
                 <div className="num text-[11px] text-ink-500">Line {i + 1} of {cart.length} · {x.item.part_number}</div>
                 <div className="text-sm font-medium text-ink-900 mt-0.5">{x.item.description}</div>
+                {!!x.item.taxable && <Badge className="bg-gold-100 text-gold-700 mt-1.5">VAT applies</Badge>}
               </div>
               <div className="flex items-center gap-4 shrink-0">
                 <div className="text-right">
@@ -349,7 +354,11 @@ export default function NewRequest() {
               <Input label="Serial number" required value={x.serial} onChange={e => setLine(x.item.id, { serial: e.target.value })} />
               <Input label="Work order" required value={x.wo} onChange={e => setLine(x.item.id, { wo: e.target.value })} />
               <div className="col-span-2"><Input label="Equipment description (optional)" value={x.equip} onChange={e => setLine(x.item.id, { equip: e.target.value })} placeholder="Ventilators, Sub-Acute" /></div>
-              <div className="col-span-2"><Input label="Model (optional)" value={x.model} onChange={e => setLine(x.item.id, { model: e.target.value })} placeholder="ASTRAL 150" /></div>
+              <div className="col-span-2">
+                {x.item.device_model
+                  ? <Input label="Model (from the contract)" value={x.item.device_model} readOnly disabled />
+                  : <Input label="Model (optional)" value={x.model} onChange={e => setLine(x.item.id, { model: e.target.value })} placeholder="ASTRAL 150" />}
+              </div>
             </div>
           </Card>
         ))}

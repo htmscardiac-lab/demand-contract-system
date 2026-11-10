@@ -153,6 +153,17 @@ export default function Contracts() {
   )
 }
 
+// Reads the VAT column of an Excel sheet: Yes / Y / True / 1 / 15% / نعم mean the part is taxable.
+const isYes = (v) => ['yes', 'y', 'true', '1', 'taxable', 'vat', '15', '15%', '0.15', 'نعم', 'خاضع', 'خاضعة'].includes(String(v ?? '').trim().toLowerCase())
+const VatBadge = ({ on }) => on
+  ? <Badge className="bg-gold-100 text-gold-700">VAT</Badge>
+  : <span className="text-[12px] text-ink-400">No VAT</span>
+
+// Turns a database "duplicate" error into something the user can act on.
+const lineError = (error) => /duplicate|unique/i.test(error.message)
+  ? 'A line with this line number already exists on this contract. Line numbers must be unique.'
+  : error.message
+
 function NewContractModal({ open, onClose, vendors, onSaved, profile }) {
   const empty = { contract_number: '', po_number: '', vendor_name: '', vendor_email: '', total_amount: '', previous_consumed_amount: '0', start_date: '', end_date: '' }
   const [f, setF] = useState(empty)
@@ -249,6 +260,7 @@ function VendorsModal({ open, onClose, vendors }) {
 
 function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
   const [showAdd, setShowAdd] = useState(false)
+  const [editItem, setEditItem] = useState(null)
   const [excelRows, setExcelRows] = useState(null)
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
@@ -280,9 +292,10 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
       const parsed = rows.map(r => ({
         line_number: Number(r[0]), description: String(r[1]).trim(),
         part_number: String(r[2]).trim(), unit_price: Number(r[3]),
+        device_model: String(r[4] ?? '').trim() || null, taxable: isYes(r[5]),
       }))
       const bad = parsed.find(p => !p.line_number || !p.description || !p.part_number || isNaN(p.unit_price))
-      if (bad) throw new Error('Some rows are invalid. Expected columns in order: Line Number, Description, Part Number, Unit Price.')
+      if (bad) throw new Error('Some rows are invalid. Expected columns in order: Line Number, Description, Part Number, Unit Price, Model, VAT (Yes or No). Model and VAT are optional.')
       setExcelRows(parsed)
     } catch (ex) { setErr(ex.message) }
     e.target.value = ''
@@ -292,7 +305,7 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
     setBusy(true); setErr('')
     const { error } = await supabase.from('contract_items').insert(excelRows.map(r => ({ ...r, contract_id: contract.id })))
     setBusy(false)
-    if (error) return setErr(error.message)
+    if (error) return setErr(lineError(error))
     setExcelRows(null); reload()
   }
 
@@ -345,21 +358,21 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
 
       {excelRows && (
         <Card className="mb-6 overflow-hidden border-steel-600/40">
-          <SectionHead title="Excel preview" hint={`${excelRows.length} rows read from the file. Nothing is saved until you import.`}
+          <SectionHead title="Excel preview" hint={`${excelRows.length} rows read from the file, ${excelRows.filter(r => r.taxable).length} with VAT. Nothing is saved until you import.`}
             right={<div className="flex gap-2">
               <Btn variant="secondary" onClick={() => setExcelRows(null)}>Discard</Btn>
               <Btn onClick={importExcel} disabled={busy}>{busy ? 'Importing…' : `Import ${excelRows.length} line items`}</Btn>
             </div>} />
           <TableWrap>
-            <thead><tr><Th>Line</Th><Th>Description</Th><Th>Part number</Th><Th right>Unit price</Th></tr></thead>
-            <tbody>{excelRows.slice(0, 8).map((r, i) => <tr key={i}><Td className="num">{r.line_number}</Td><Td>{r.description}</Td><Td className="num text-[13px]">{r.part_number}</Td><Td right className="num">{money(r.unit_price)}</Td></tr>)}</tbody>
+            <thead><tr><Th>Line</Th><Th>Description</Th><Th>Part number</Th><Th>Model</Th><Th>VAT</Th><Th right>Unit price</Th></tr></thead>
+            <tbody>{excelRows.slice(0, 8).map((r, i) => <tr key={i}><Td className="num">{r.line_number}</Td><Td>{r.description}</Td><Td className="num text-[13px]">{r.part_number}</Td><Td>{r.device_model || <span className="text-ink-300">—</span>}</Td><Td><VatBadge on={r.taxable} /></Td><Td right className="num">{money(r.unit_price)}</Td></tr>)}</tbody>
           </TableWrap>
           {excelRows.length > 8 && <div className="text-[13px] text-ink-500 px-5 py-3">and {excelRows.length - 8} more rows</div>}
         </Card>
       )}
 
       <Card className="overflow-hidden">
-        <SectionHead title={`Line items · ${items.length}`} hint={canEdit ? 'Excel columns in order: line number, description, part number, unit price.' : undefined}
+        <SectionHead title={`Line items · ${items.length}`} hint={canEdit ? 'Excel columns in order: line number, description, part number, unit price, model, VAT (Yes or No).' : undefined}
           right={canEdit && <div className="flex gap-2">
             <label className="inline-flex items-center justify-center gap-2 h-9.5 px-4 rounded-lg text-sm font-medium bg-white hover:bg-ink-50 text-ink-800 border border-ink-300 cursor-pointer transition-colors">
               <Icon name="upload" className="w-4 h-4" />Upload Excel
@@ -369,7 +382,7 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
           </div>} />
         {items.length === 0 ? <Empty icon="box" title="No line items yet" hint="Upload the contract's Excel sheet or add line items one by one." /> : (
           <TableWrap>
-            <thead><tr><Th className="w-16">Line</Th><Th className="w-16">Image</Th><Th>Description</Th><Th>Part number</Th><Th right>Unit price</Th>{canEdit && <Th></Th>}</tr></thead>
+            <thead><tr><Th className="w-16">Line</Th><Th className="w-16">Image</Th><Th>Description</Th><Th>Part number</Th><Th>Model</Th><Th>VAT</Th><Th right>Unit price</Th>{canEdit && <Th></Th>}</tr></thead>
             <tbody>
               {items.map(it => (
                 <tr key={it.id}>
@@ -381,9 +394,12 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
                   </Td>
                   <Td className="max-w-[360px] text-ink-900">{it.description}</Td>
                   <Td className="num text-[13px]">{it.part_number}</Td>
+                  <Td>{it.device_model || <span className="text-ink-300">—</span>}</Td>
+                  <Td><VatBadge on={it.taxable} /></Td>
                   <Td right className="num text-ink-900">{money(it.unit_price)}</Td>
                   {canEdit && (
                     <Td right>
+                      <button onClick={() => setEditItem(it)} className="text-[13px] font-medium text-brand-700 hover:underline whitespace-nowrap mr-4">Edit</button>
                       <label className="text-[13px] font-medium text-brand-700 hover:underline cursor-pointer whitespace-nowrap">
                         {it.image_path ? 'Replace image' : 'Add image'}
                         <input type="file" accept="image/*" className="sr-only" onChange={e => uploadImage(it, e.target.files?.[0])} />
@@ -396,37 +412,58 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
           </TableWrap>
         )}
       </Card>
-      <AddItemModal open={showAdd} onClose={() => setShowAdd(false)} contract={contract} onSaved={() => { setShowAdd(false); reload() }} />
+      <ItemModal open={showAdd || !!editItem} item={editItem} contract={contract}
+        onClose={() => { setShowAdd(false); setEditItem(null) }} onSaved={() => { setShowAdd(false); setEditItem(null); reload() }} />
     </div>
   )
 }
 
-function AddItemModal({ open, onClose, contract, onSaved }) {
-  const empty = { line_number: '', description: '', part_number: '', unit_price: '' }
+function ItemModal({ open, onClose, contract, onSaved, item }) {
+  const empty = { line_number: '', description: '', part_number: '', unit_price: '', device_model: '', taxable: false }
   const [f, setF] = useState(empty)
   const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
   const set = k => e => setF(x => ({ ...x, [k]: e.target.value }))
-  const save = async () => {
+  useEffect(() => {
+    if (!open) return
     setErr('')
-    const { error } = await supabase.from('contract_items').insert({
-      contract_id: contract.id, line_number: Number(f.line_number),
-      description: f.description.trim(), part_number: f.part_number.trim(), unit_price: Number(f.unit_price),
-    })
-    if (error) return setErr(error.message)
-    setF(empty); onSaved()
+    setF(item ? { line_number: item.line_number, description: item.description, part_number: item.part_number,
+      unit_price: item.unit_price, device_model: item.device_model || '', taxable: !!item.taxable } : empty)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, item])
+  const save = async () => {
+    setErr(''); setBusy(true)
+    const row = {
+      line_number: Number(f.line_number), description: String(f.description).trim(), part_number: String(f.part_number).trim(),
+      unit_price: Number(f.unit_price), device_model: f.device_model.trim() || null, taxable: f.taxable,
+    }
+    const { error } = item
+      ? await supabase.from('contract_items').update(row).eq('id', item.id)
+      : await supabase.from('contract_items').insert({ ...row, contract_id: contract.id })
+    setBusy(false)
+    if (error) return setErr(lineError(error))
+    onSaved()
   }
   return (
-    <Modal open={open} onClose={onClose} title="Add line item">
+    <Modal open={open} onClose={onClose} title={item ? 'Edit line item' : 'Add line item'}>
       {err && <Alert>{err}</Alert>}
       <div className="grid gap-4 sm:grid-cols-2">
         <Input label="Line number" type="number" value={f.line_number} onChange={set('line_number')} />
         <Input label="Part number" value={f.part_number} onChange={set('part_number')} />
         <div className="sm:col-span-2"><Input label="Description" value={f.description} onChange={set('description')} /></div>
+        <Input label="Model" value={f.device_model} onChange={set('device_model')} placeholder="ASTRAL 150" />
         <Input label="Unit price" type="number" min="0" step="0.01" value={f.unit_price} onChange={set('unit_price')} />
+        <label className={`sm:col-span-2 flex items-center gap-3 px-4 py-3 rounded-lg border cursor-pointer transition-colors ${f.taxable ? 'border-ink-900 bg-ink-50' : 'border-ink-200 hover:border-ink-400'}`}>
+          <input type="checkbox" checked={f.taxable} onChange={e => setF(x => ({ ...x, taxable: e.target.checked }))} className="w-4 h-4 accent-brand-600" />
+          <span>
+            <span className="block text-sm font-medium text-ink-900">VAT applies to this part</span>
+            <span className="block text-[12px] text-ink-500">Leave unticked for parts that are not taxed.</span>
+          </span>
+        </label>
       </div>
       <div className="flex justify-end gap-2 mt-6">
         <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
-        <Btn onClick={save} disabled={!f.line_number || !f.description || !f.part_number || f.unit_price === ''}>Add line item</Btn>
+        <Btn onClick={save} disabled={busy || !f.line_number || !f.description || !f.part_number || f.unit_price === ''}>{item ? 'Save changes' : 'Add line item'}</Btn>
       </div>
     </Modal>
   )

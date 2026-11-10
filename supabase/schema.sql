@@ -55,6 +55,8 @@ create table if not exists public.contract_items (
   description  text not null,
   part_number  text not null,
   unit_price   numeric(14,2) not null check (unit_price >= 0),
+  device_model text,
+  taxable      boolean not null default false,
   image_path   text,
   unique (contract_id, line_number)
 );
@@ -97,7 +99,8 @@ create table if not exists public.request_items (
   received_by            uuid references public.profiles(id) on delete set null,
   line_number            integer,
   equipment_description  text,
-  device_model           text
+  device_model           text,
+  taxable                boolean not null default false
 );
 
 create table if not exists public.notifications (
@@ -133,6 +136,11 @@ insert into public.app_settings(key, value) values
   ('department_email', ''),
   ('department_name', 'Healthcare Technology Management Services (HTMS)')
 on conflict (key) do nothing;
+
+-- Columns added after the first release (safe to re-run on an existing database).
+alter table public.contract_items add column if not exists device_model text;
+alter table public.contract_items add column if not exists taxable boolean not null default false;
+alter table public.request_items  add column if not exists taxable boolean not null default false;
 
 create sequence if not exists public.request_number_seq;
 
@@ -380,10 +388,13 @@ create or replace function public._insert_items(p_request_id bigint, p_contract_
 language sql security definer set search_path = public as $$
   insert into request_items(request_id, contract_item_id, part_number, description, unit_price, quantity,
                             htm_number, serial_number, work_order_number, line_number,
-                            equipment_description, device_model)
+                            equipment_description, device_model, taxable)
   select p_request_id, ci.id, ci.part_number, ci.description, ci.unit_price, (it->>'quantity')::integer,
          trim(it->>'htm_number'), trim(it->>'serial_number'), trim(it->>'work_order_number'), ci.line_number,
-         coalesce(trim(it->>'equipment_description'), ''), coalesce(trim(it->>'device_model'), '')
+         coalesce(trim(it->>'equipment_description'), ''),
+         -- model comes from the contract line; a value typed on the request only fills a blank
+         coalesce(nullif(trim(ci.device_model), ''), trim(it->>'device_model'), ''),
+         ci.taxable
   from jsonb_array_elements(p_items) with ordinality as x(it, ord)
   join contract_items ci on ci.id = (it->>'contract_item_id')::bigint and ci.contract_id = p_contract_id
   order by ord

@@ -301,6 +301,7 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
                   <div className="min-w-0">
                     <div className="text-sm font-medium text-ink-900">{it.description}</div>
                     <div className="num text-[12px] text-ink-500 mt-0.5">{it.line_number ? `Line ${it.line_number} · ` : ''}{it.part_number}</div>
+                    {!!it.taxable && <Badge className="bg-gold-100 text-gold-700 mt-1.5">VAT applies</Badge>}
                   </div>
                   <div className="text-right shrink-0">
                     <div className="num text-sm font-medium text-ink-900">{money(it.unit_price * it.quantity)}</div>
