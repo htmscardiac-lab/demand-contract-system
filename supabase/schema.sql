@@ -45,7 +45,10 @@ create table if not exists public.contracts (
   start_date                date not null,
   end_date                  date not null,
   created_by                uuid references public.profiles(id) on delete set null,
-  created_at                timestamptz not null default now()
+  created_at                timestamptz not null default now(),
+  -- VAT is released against its own contract line: quantity = VAT amount / line value
+  vat_line_number           integer,
+  vat_line_value            numeric(14,2) check (vat_line_value > 0)
 );
 
 create table if not exists public.contract_items (
@@ -86,21 +89,22 @@ create table if not exists public.requests (
 create table if not exists public.request_items (
   id                     bigint generated always as identity primary key,
   request_id             bigint not null references public.requests(id) on delete cascade,
-  contract_item_id       bigint not null references public.contract_items(id),
+  contract_item_id       bigint references public.contract_items(id),   -- null on the VAT line
   part_number            text not null,
   description            text not null,
   unit_price             numeric(14,2) not null,
-  quantity               integer not null check (quantity >= 1),
+  quantity               numeric(14,4) not null check (quantity > 0),
   htm_number             text not null,
   serial_number          text not null,
   work_order_number      text not null,
-  received_quantity      integer not null default 0,
+  received_quantity      numeric(14,4) not null default 0,
   received_at            timestamptz,
   received_by            uuid references public.profiles(id) on delete set null,
   line_number            integer,
   equipment_description  text,
   device_model           text,
-  taxable                boolean not null default false
+  taxable                boolean not null default false,
+  is_vat                 boolean not null default false
 );
 
 create table if not exists public.notifications (
@@ -138,9 +142,22 @@ insert into public.app_settings(key, value) values
 on conflict (key) do nothing;
 
 -- Columns added after the first release (safe to re-run on an existing database).
+-- The balances view reads request_items.quantity, so it is dropped here and
+-- recreated in section 3 after the column types are changed.
+drop view if exists public.contract_balances;
+
 alter table public.contract_items add column if not exists device_model text;
 alter table public.contract_items add column if not exists taxable boolean not null default false;
 alter table public.request_items  add column if not exists taxable boolean not null default false;
+
+alter table public.contracts add column if not exists vat_line_number integer;
+alter table public.contracts add column if not exists vat_line_value numeric(14,2) check (vat_line_value > 0);
+alter table public.request_items add column if not exists is_vat boolean not null default false;
+alter table public.request_items alter column contract_item_id drop not null;
+alter table public.request_items alter column quantity type numeric(14,4);
+alter table public.request_items alter column received_quantity type numeric(14,4);
+alter table public.request_items drop constraint if exists request_items_quantity_check;
+alter table public.request_items add constraint request_items_quantity_check check (quantity > 0);
 
 create sequence if not exists public.request_number_seq;
 
@@ -384,6 +401,28 @@ begin
   return total;
 end $$;
 
+-- VAT due on the taxable lines of a request, expressed on the contract's VAT line.
+-- VAT rate is 15%. Quantity on the VAT line = VAT amount / VAT line value, to 4 decimals.
+create or replace function public._vat_for(p_contract_id bigint, p_items jsonb,
+  out vat_qty numeric, out vat_amount numeric, out vat_line integer, out vat_value numeric)
+language plpgsql stable security definer set search_path = public as $$
+declare taxable_total numeric; c contracts;
+begin
+  vat_qty := 0; vat_amount := 0;
+  select coalesce(sum(ci.unit_price * (it->>'quantity')::integer), 0) into taxable_total
+    from jsonb_array_elements(p_items) it
+    join contract_items ci on ci.id = (it->>'contract_item_id')::bigint and ci.contract_id = p_contract_id
+   where ci.taxable;
+  if taxable_total = 0 then return; end if;
+  select * into c from contracts where id = p_contract_id;
+  if c.vat_line_number is null or c.vat_line_value is null then
+    raise exception 'VAT_LINE_MISSING: this request has parts with VAT, but the contract has no VAT line. Ask a supervisor to set the VAT line on the contract first.';
+  end if;
+  vat_line := c.vat_line_number; vat_value := c.vat_line_value;
+  vat_qty := round(round(taxable_total * 0.15, 2) / c.vat_line_value, 4);
+  vat_amount := round(vat_qty * c.vat_line_value, 2);
+end $$;
+
 create or replace function public._insert_items(p_request_id bigint, p_contract_id bigint, p_items jsonb) returns void
 language sql security definer set search_path = public as $$
   insert into request_items(request_id, contract_item_id, part_number, description, unit_price, quantity,
@@ -397,7 +436,16 @@ language sql security definer set search_path = public as $$
          ci.taxable
   from jsonb_array_elements(p_items) with ordinality as x(it, ord)
   join contract_items ci on ci.id = (it->>'contract_item_id')::bigint and ci.contract_id = p_contract_id
-  order by ord
+  order by ord;
+
+  -- the VAT line, added automatically when any requested part is taxable
+  insert into request_items(request_id, contract_item_id, part_number, description, unit_price, quantity,
+                            htm_number, serial_number, work_order_number, line_number,
+                            equipment_description, device_model, taxable, is_vat)
+  select p_request_id, null, 'VAT', 'Value Added Tax (15%)', v.vat_value, v.vat_qty,
+         '', '', '', v.vat_line, '', '', false, true
+  from _vat_for(p_contract_id, p_items) v
+  where v.vat_qty > 0;
 $$;
 
 create or replace function public.check_duplicates(p_items jsonb) returns jsonb
@@ -410,6 +458,7 @@ language sql stable security definer set search_path = public as $$
   join requests r on r.id = ri.request_id
   join profiles p on p.id = r.engineer_id
   where public.is_active_user()
+    and not ri.is_vat
     and (r.status in ('pending','pending_clinical')
          or (r.status in ('in_process','approved') and ri.received_quantity < ri.quantity))
 $$;
@@ -417,7 +466,7 @@ $$;
 create or replace function public.submit_request(p_contract_id bigint, p_supervisor_id text, p_items jsonb)
 returns jsonb language plpgsql security definer set search_path = public as $$
 declare
-  me profiles; sup uuid; st text; total numeric; remaining numeric; rid bigint; rno text;
+  me profiles; sup uuid; st text; total numeric; vat numeric; remaining numeric; rid bigint; rno text;
 begin
   select * into me from profiles where id = auth.uid();
   if me.id is null or not me.is_active then raise exception 'Your account is not active yet.'; end if;
@@ -436,6 +485,8 @@ begin
   perform 1 from contracts where id = p_contract_id for update;
   if not found then raise exception 'Contract not found.'; end if;
   total := _validate_items(p_contract_id, p_items);
+  select vat_amount into vat from _vat_for(p_contract_id, p_items);
+  total := total + vat;   -- prices on contract lines are before VAT
   remaining := contract_remaining(p_contract_id);
   if total > remaining then
     raise exception 'INSUFFICIENT_BALANCE: request total (%) exceeds remaining contract balance (%).',
@@ -454,13 +505,13 @@ begin
     perform notify_clinical_pool('request_at_clinical',
       format('Request %s was sent to the Clinical Engineer (created by %s).', rno, me.full_name), rid);
   end if;
-  return jsonb_build_object('request_id', rid, 'request_number', rno, 'total', total, 'status', st);
+  return jsonb_build_object('request_id', rid, 'request_number', rno, 'total', total, 'vat', vat, 'status', st);
 end $$;
 
 create or replace function public.update_request(p_request_id bigint, p_items jsonb, p_supervisor_id text default null)
 returns jsonb language plpgsql security definer set search_path = public as $$
 declare
-  me profiles; r requests; sup uuid; total numeric;
+  me profiles; r requests; sup uuid; total numeric; vat numeric;
 begin
   select * into me from profiles where id = auth.uid();
   select * into r from requests where id = p_request_id for update;
@@ -475,6 +526,8 @@ begin
   end if;
   perform 1 from contracts where id = r.contract_id for update;
   total := _validate_items(r.contract_id, p_items);
+  select vat_amount into vat from _vat_for(r.contract_id, p_items);
+  total := total + vat;
   if total > contract_remaining(r.contract_id) then
     raise exception 'INSUFFICIENT_BALANCE: request total (%) exceeds remaining contract balance.',
       to_char(total, 'FM999999999990.00');
@@ -482,7 +535,7 @@ begin
   delete from request_items where request_id = p_request_id;
   perform _insert_items(p_request_id, r.contract_id, p_items);
   update requests set supervisor_id = sup where id = p_request_id;
-  return jsonb_build_object('request_id', p_request_id, 'total', total);
+  return jsonb_build_object('request_id', p_request_id, 'total', total, 'vat', vat);
 end $$;
 
 create or replace function public.cancel_request(p_request_id bigint)
@@ -648,9 +701,10 @@ begin
   from (select distinct unnest(array[r.engineer_id, r.supervisor_id]) as u) x;
 end $$;
 
-create or replace function public.receive_items(p_item_id bigint, p_quantity integer)
+drop function if exists public.receive_items(bigint, integer);
+create or replace function public.receive_items(p_item_id bigint, p_quantity numeric)
 returns jsonb language plpgsql security definer set search_path = public as $$
-declare it request_items; r requests; nv integer;
+declare it request_items; r requests; nv numeric;
 begin
   select * into it from request_items where id = p_item_id for update;
   if it.id is null then raise exception 'Item not found.'; end if;
@@ -661,7 +715,8 @@ begin
   if r.status not in ('in_process','approved','closed') then
     raise exception 'Items can only be received on processed requests.';
   end if;
-  if p_quantity is null or p_quantity < 1 then raise exception 'Received quantity must be at least 1.'; end if;
+  if p_quantity is null or p_quantity <= 0 then raise exception 'Received quantity must be more than zero.'; end if;
+  if not it.is_vat and p_quantity <> trunc(p_quantity) then raise exception 'Parts are received in whole units.'; end if;
   nv := it.received_quantity + p_quantity;
   if nv > it.quantity then
     raise exception 'Received quantity (%) would exceed the requested quantity (%). Outstanding: %.',
@@ -742,10 +797,10 @@ begin
                'approve_final','update_tracking','receive_items','receive_all','mark_received',
                'archive_request','unarchive_request',
                -- internal helpers: never callable from the browser
-               '_validate_items','_insert_items','_maybe_close','notify_user','notify_clinical_pool',
+               '_validate_items','_insert_items','_vat_for','_maybe_close','notify_user','notify_clinical_pool',
                'handle_new_user','audit_trigger') loop
     execute format('revoke all on function %s from public, anon, authenticated', f.sig);
-    if f.proname not in ('_validate_items','_insert_items','_maybe_close','notify_user',
+    if f.proname not in ('_validate_items','_insert_items','_vat_for','_maybe_close','notify_user',
                          'notify_clinical_pool','handle_new_user','audit_trigger') then
       execute format('grant execute on function %s to authenticated', f.sig);
     end if;

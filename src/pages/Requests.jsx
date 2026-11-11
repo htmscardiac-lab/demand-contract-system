@@ -5,7 +5,7 @@ import { useApp } from '../App.jsx'
 import { usePoll } from '../lib/poll.js'
 import { Card, Btn, Input, Select, Textarea, Badge, Modal, Drawer, Spinner, Empty, PageTitle, Alert, TableWrap, Th, Td, Row,
          Tabs, SearchInput, Field, Meter, Icon } from '../ui.jsx'
-import { money, fmtDate, fmtDateTime, STATUS_STYLE, statusLabel, receiptLabel, actionFor, requestTotal, isOverdue,
+import { money, fmtDate, fmtDateTime, STATUS_STYLE, statusLabel, receiptLabel, actionFor, requestTotal, isOverdue, fmtQty,
          ACTIVE_STATUSES, DONE_STATUSES, buildTimeline, buildApprovalEmail, downloadOutlookEmail } from '../lib/helpers'
 
 export const REQUEST_QUERY = `*, request_items(*),
@@ -115,11 +115,12 @@ export default function Requests() {
             })}
           </ul>
           <TableWrap className="hidden md:block">
-            <thead><tr><Th>Request</Th><Th>Requested by</Th><Th>Contract</Th><Th right>Total</Th><Th>Status</Th><Th>Release</Th><Th>Promise date</Th><Th>Received</Th></tr></thead>
+            <thead><tr><Th>Request</Th><Th>Requested by</Th><Th>Contract</Th><Th right>Total</Th><Th>Status</Th><Th>Release</Th><Th>Promise date</Th><Th>Lines received</Th></tr></thead>
             <tbody>
               {shown.map(r => {
-                const tot = r.request_items.reduce((s, i) => s + i.quantity, 0)
-                const got = r.request_items.reduce((s, i) => s + (i.received_quantity || 0), 0)
+                // counted in lines, so the fractional VAT line reads the same as a part line
+                const tot = r.request_items.length
+                const got = r.request_items.filter(i => (i.received_quantity || 0) >= i.quantity).length
                 const tracked = ['in_process', 'approved', 'closed'].includes(r.status)
                 const late = isOverdue(r)
                 return (
@@ -132,7 +133,7 @@ export default function Requests() {
                     <Td className="num text-[13px] whitespace-nowrap">{r.release_number || <span className="text-ink-300">—</span>}</Td>
                     <Td className={late ? 'text-brand-700 font-medium' : ''}>{r.promise_date ? fmtDate(r.promise_date) : <span className="text-ink-300">—</span>}{late && <div className="text-[12px] font-normal">Overdue</div>}</Td>
                     <Td>{tracked ? (
-                      <div className="w-24"><div className="num text-[12px] text-ink-600 mb-1">{got} / {tot}</div><Meter pct={tot ? got / tot * 100 : 0} /></div>
+                      <div className="w-24"><div className="num text-[12px] text-ink-600 mb-1">{got} / {tot} lines</div><Meter pct={tot ? got / tot * 100 : 0} /></div>
                     ) : <span className="text-ink-300">—</span>}</Td>
                   </Row>
                 )
@@ -192,6 +193,9 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
 
   const view = { ...r, request_items: items, status }
   const total = items.reduce((s, i) => s + i.unit_price * i.quantity, 0)
+  const parts = items.filter(i => !i.is_vat)
+  const vatLine = items.find(i => i.is_vat)
+  const partsSum = parts.reduce((s, i) => s + i.unit_price * i.quantity, 0)
   const isOwner = r.engineer?.id === profile.id
   const isSup = r.supervisor?.id === profile.id
   const admin = profile.role === 'admin'
@@ -274,7 +278,9 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
           <Field label="Vendor">{r.contracts?.vendors?.name}</Field>
           <Field label="Contract">{r.contracts?.contract_number}</Field>
           <Field label="PO number"><span className="num">{r.contracts?.po_number}</span></Field>
-          <Field label="Request total"><span className="num font-medium">{money(total)}</span></Field>
+          <Field label={vatLine ? 'Total, including VAT' : 'Request total'}><span className="num font-medium">{money(total)}</span></Field>
+          {vatLine && <Field label="Parts, before VAT"><span className="num">{money(partsSum)}</span></Field>}
+          {vatLine && <Field label="VAT 15%"><span className="num">{money(vatLine.unit_price * vatLine.quantity)}</span></Field>}
           {r.release_number && <Field label="Release"><span className="num">{r.release_number}</span></Field>}
           {r.promise_date && <Field label="Promise date">{fmtDate(r.promise_date)}</Field>}
         </dl>
@@ -287,13 +293,13 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
 
       <Card className="overflow-hidden">
         <div className="flex flex-wrap items-center justify-between gap-2 px-5 py-3.5 border-b border-ink-100">
-          <h4 className="font-display font-semibold text-[13px] tracking-[0.08em] uppercase text-ink-500">Parts and devices · {items.length}</h4>
+          <h4 className="font-display font-semibold text-[13px] tracking-[0.08em] uppercase text-ink-500">Parts and devices · {parts.length}</h4>
           {canTrack && items.some(i => i.quantity > (i.received_quantity || 0)) && (
             <Btn size="sm" variant="secondary" icon="box" disabled={busy} onClick={() => call('receive_all', { p_request_id: r.id }, 'All outstanding parts received.', refresh)}>Receive all outstanding</Btn>
           )}
         </div>
         <ul>
-          {items.map(it => {
+          {parts.map(it => {
             const outstanding = it.quantity - (it.received_quantity || 0)
             return (
               <li key={it.id} className="px-5 py-4 border-b border-ink-100 last:border-0">
@@ -305,7 +311,7 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
                   </div>
                   <div className="text-right shrink-0">
                     <div className="num text-sm font-medium text-ink-900">{money(it.unit_price * it.quantity)}</div>
-                    <div className="num text-[12px] text-ink-500 mt-0.5">{it.quantity} × {money(it.unit_price)}</div>
+                    <div className="text-[12px] text-ink-500 mt-0.5"><span className="num">{fmtQty(it.quantity)} × {money(it.unit_price)}</span> before VAT</div>
                   </div>
                 </div>
                 <dl className="grid grid-cols-3 gap-3 mt-3 rounded-lg bg-ink-50 px-3 py-2.5">
@@ -332,6 +338,29 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
               </li>
             )
           })}
+          {vatLine && (
+            <li className="px-5 py-4 bg-gold-100/40 border-t border-gold-200">
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0">
+                  <div className="text-sm font-medium text-ink-900">VAT line</div>
+                  <div className="text-[12px] text-ink-600 mt-0.5">
+                    Line <span className="num">{vatLine.line_number}</span> · 15% of the taxed parts · quantity <span className="num">{fmtQty(vatLine.quantity)}</span> × <span className="num">{money(vatLine.unit_price)}</span>
+                  </div>
+                </div>
+                <div className="num text-sm font-medium text-ink-900 shrink-0">{money(vatLine.unit_price * vatLine.quantity)}</div>
+              </div>
+              {canTrack && (
+                <div className="flex flex-wrap items-center justify-between gap-2 mt-3">
+                  {vatLine.received_quantity >= vatLine.quantity
+                    ? <Badge className="bg-olive-100 text-olive-700"><Icon name="check" className="w-3 h-3" strokeWidth={2.6} />Received</Badge>
+                    : <>
+                        <Badge className="bg-ink-100 text-ink-600">Not received</Badge>
+                        <Btn size="sm" variant="success" disabled={busy} onClick={() => call('receive_items', { p_item_id: vatLine.id, p_quantity: vatLine.quantity - (vatLine.received_quantity || 0) }, 'VAT line received.', refresh)}>Receive VAT line</Btn>
+                      </>}
+                </div>
+              )}
+            </li>
+          )}
         </ul>
       </Card>
 

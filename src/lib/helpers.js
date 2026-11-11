@@ -34,6 +34,19 @@ export function actionFor(r, profile) {
   if (r.status === 'returned' && r.engineer_id === profile.id) return 'Amend and resubmit'
   return null
 }
+// VAT: prices on contract lines are before VAT. VAT is released against the contract's own
+// VAT line: quantity = VAT amount / VAT line value (4 decimals). Mirrors _vat_for() in the database.
+export const VAT_RATE = 0.15
+const r2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100
+export function vatFor(taxableSubtotal, vatLineValue) {
+  const value = Number(vatLineValue)
+  if (!(taxableSubtotal > 0) || !(value > 0)) return { qty: 0, amount: 0 }
+  const qty = Math.round(r2(taxableSubtotal * VAT_RATE) / value * 10000) / 10000
+  return { qty, amount: r2(qty * value) }
+}
+export const fmtQty = (n) => String(Number(Number(n ?? 0).toFixed(4)))
+export const partsTotal = (r) => (r.request_items || []).filter(i => !i.is_vat).reduce((s, i) => s + i.unit_price * i.quantity, 0)
+export const vatTotal = (r) => (r.request_items || []).filter(i => i.is_vat).reduce((s, i) => s + i.unit_price * i.quantity, 0)
 export const requestTotal = (r) => (r.request_items || []).reduce((s, i) => s + i.unit_price * i.quantity, 0)
 export const isOverdue = (r) => ['in_process', 'approved'].includes(r.status) && r.promise_date
   && new Date(r.promise_date) < new Date(new Date().toDateString())
@@ -42,7 +55,7 @@ export const ROLE_LABEL = { engineer: 'Engineer', supervisor: 'Supervisor', clin
 export const statusLabel = (s) => STATUS_LABEL[s] || s
 export const receiptLabel = (it) =>
   it.received_quantity >= it.quantity ? 'Received'
-    : it.received_quantity > 0 ? `Partial ${it.received_quantity}/${it.quantity}`
+    : it.received_quantity > 0 ? `Partial ${fmtQty(it.received_quantity)}/${fmtQty(it.quantity)}`
     : 'Not received'
 
 // Detailed timeline for the engineer's tracking screen.
@@ -82,7 +95,8 @@ export function buildApprovalEmail(req, settings = {}) {
   const deptEmail = settings.department_email || ''
   const deptName = settings.department_name || 'Healthcare Technology Management Services (HTMS)'
   const c = req.contracts
-  const items = req.request_items || []
+  // parts in contract-line order as entered, VAT line last
+  const items = [...(req.request_items || [])].sort((a, b) => (a.is_vat ? 1 : 0) - (b.is_vat ? 1 : 0) || a.id - b.id)
   const total = items.reduce((s, it) => s + it.unit_price * it.quantity, 0)
   const rel = req.release_number || ''
   const promised = req.promise_date
@@ -91,7 +105,7 @@ export function buildApprovalEmail(req, settings = {}) {
   const subject = `Blanket Release ${rel} — Demand Contract ${c?.contract_number ?? ''}`.trim()
 
   const rowsText = items.map(it =>
-    `${it.line_number ?? ''} | ${it.description} | ${it.quantity} | ${it.equipment_description || ''} | ${it.device_model || ''}`)
+    `${it.line_number ?? ''} | ${it.description} | ${fmtQty(it.quantity)} | ${it.equipment_description || ''} | ${it.device_model || ''}`)
   const body = [
     'Dear Engr. ______________,',
     'Greetings.',
@@ -108,7 +122,7 @@ export function buildApprovalEmail(req, settings = {}) {
 
   const rowsHtml = items.map(it => `<tr>
 <td align="center">${esc(it.line_number)}</td><td>${esc(it.description)}</td>
-<td align="center">${esc(it.quantity)}</td><td>${esc(it.equipment_description)}</td><td align="center">${esc(it.device_model)}</td></tr>`).join('')
+<td align="center">${esc(fmtQty(it.quantity))}</td><td>${esc(it.equipment_description)}</td><td align="center">${esc(it.device_model)}</td></tr>`).join('')
 
   const html = `<html><body style="font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#1f2937">
 <p>Dear Engr. ______________,<br>Greetings.</p>

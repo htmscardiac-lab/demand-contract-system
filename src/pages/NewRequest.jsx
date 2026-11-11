@@ -3,7 +3,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom'
 import { supabase, imgUrl } from '../lib/supabase'
 import { useApp } from '../App.jsx'
 import { Card, SectionHead, Btn, Input, Select, Modal, Empty, PageTitle, BackLink, Alert, Badge, SearchInput, Icon } from '../ui.jsx'
-import { money, statusLabel } from '../lib/helpers'
+import { money, statusLabel, vatFor, fmtQty } from '../lib/helpers'
 
 export default function NewRequest() {
   const { profile } = useApp()
@@ -103,6 +103,12 @@ export default function NewRequest() {
   const removeLine = (id) => setCart(c => c.filter(x => x.item.id !== id))
   const total = useMemo(() => cart.reduce((s, x) => s + x.item.unit_price * x.quantity, 0), [cart])
 
+  // VAT is added as its own line: 15% of the taxed parts, as a quantity of the contract's VAT line
+  const taxable = useMemo(() => cart.filter(x => x.item.taxable).reduce((s, x) => s + x.item.unit_price * x.quantity, 0), [cart])
+  const vatMissing = taxable > 0 && !(Number(contract?.vat_line_value) > 0 && contract?.vat_line_number)
+  const vat = vatFor(taxable, contract?.vat_line_value)
+  const grandTotal = total + vat.amount
+
   const filtered = items.filter(i =>
     !search || i.description.toLowerCase().includes(search.toLowerCase()) || i.part_number.toLowerCase().includes(search.toLowerCase()))
 
@@ -113,7 +119,8 @@ export default function NewRequest() {
         return `Line "${x.item.part_number}": HTM Number, Serial Number and Work Order Number are all required.`
       if (x.quantity < 1) return 'Quantities must be at least 1.'
     }
-    if (bal && total > Number(bal.remaining)) return `Request total (${money(total)}) exceeds the remaining contract balance (${money(bal.remaining)}).`
+    if (vatMissing) return 'This request has parts with VAT, but the contract has no VAT line. Ask a supervisor to set the VAT line on the contract first.'
+    if (bal && grandTotal > Number(bal.remaining)) return `Request total including VAT (${money(grandTotal)}) exceeds the remaining contract balance (${money(bal.remaining)}).`
     return null
   }
 
@@ -211,7 +218,7 @@ export default function NewRequest() {
       <div className="w-12 h-12 rounded-full bg-olive-100 text-olive-700 flex items-center justify-center mx-auto mb-4"><Icon name="check" /></div>
       <h1 className="font-display font-semibold text-xl tracking-wide uppercase">Request submitted</h1>
       <div className="num text-2xl font-medium text-ink-900 mt-4">{done.request_number}</div>
-      <div className="num text-sm text-ink-500 mt-1 mb-4">Total {money(done.total)}</div>
+      <div className="text-sm text-ink-500 mt-1 mb-4">Total <span className="num">{money(done.total)}</span>{Number(done.vat) > 0 && <> including VAT <span className="num">{money(done.vat)}</span></>}</div>
       <p className="text-sm text-ink-500 mb-6">
         {done.status === 'pending_clinical' ? 'The clinical engineers have been notified.' : 'Your supervisor has been notified.'}
       </p>
@@ -294,7 +301,7 @@ export default function NewRequest() {
                     {!!it.taxable && <Badge className="bg-gold-100 text-gold-700">VAT</Badge>}
                   </div>
                   <div className="flex items-center justify-between gap-2 mt-3">
-                    <span className="num text-sm font-medium text-ink-900">{money(it.unit_price)}</span>
+                    <span><span className="num text-sm font-medium text-ink-900">{money(it.unit_price)}</span> <span className="text-[11px] text-ink-500">before VAT</span></span>
                     {inCart && <Badge className="bg-ink-900 text-white num">× {inCart.quantity}</Badge>}
                   </div>
                   <Btn size="sm" className="mt-3 w-full" variant={inCart ? 'secondary' : 'dark'} icon="plus" onClick={() => addToCart(it)}>
@@ -311,7 +318,7 @@ export default function NewRequest() {
           <div className="max-w-[1320px] mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-4">
             <div className="text-sm">
               <span className="num font-medium">{cart.reduce((n, x) => n + x.quantity, 0)}</span> part{cart.reduce((n, x) => n + x.quantity, 0) > 1 ? 's' : ''} on {cart.length} line{cart.length > 1 ? 's' : ''}
-              <span className="text-ink-400"> · </span><span className="num font-medium">{money(total)}</span>
+              <span className="text-ink-400"> · </span><span className="num font-medium">{money(total)}</span> <span className="text-ink-400">before VAT</span>
             </div>
             <Btn onClick={() => setStep('review')}>Continue to device details<Icon name="right" className="w-4 h-4" /></Btn>
           </div>
@@ -321,7 +328,7 @@ export default function NewRequest() {
   )
 
   // review
-  const over = bal && total > Number(bal.remaining)
+  const over = bal && grandTotal > Number(bal.remaining)
   return (
     <div className="max-w-4xl pb-10">
       <PageTitle back={<BackLink onClick={() => setStep('browse')}>{editId ? 'Add more parts' : 'Back to parts'}</BackLink>}
@@ -329,6 +336,7 @@ export default function NewRequest() {
       {!editId && <Stepper />}
       {err && <Alert>{err}</Alert>}
       {contract && <ContractBar />}
+      {vatMissing && <Alert>This request has parts with VAT, but contract {contract.contract_number} has no VAT line. A supervisor needs to set the VAT line on the contract before the request can be submitted.</Alert>}
       <div className="space-y-4 mb-5">
         {cart.map((x, i) => (
           <Card key={x.item.id} className="overflow-hidden">
@@ -341,7 +349,7 @@ export default function NewRequest() {
               <div className="flex items-center gap-4 shrink-0">
                 <div className="text-right">
                   <div className="num text-sm font-medium text-ink-900">{money(x.item.unit_price * x.quantity)}</div>
-                  <div className="num text-[12px] text-ink-500">{money(x.item.unit_price)} each</div>
+                  <div className="text-[12px] text-ink-500"><span className="num">{money(x.item.unit_price)}</span> each, before VAT</div>
                 </div>
                 <button onClick={() => removeLine(x.item.id)} aria-label={`Remove ${x.item.part_number}`} title="Remove line"
                   className="w-8 h-8 rounded-md flex items-center justify-center text-ink-400 hover:text-brand-700 hover:bg-brand-50"><Icon name="trash" className="w-4 h-4" /></button>
@@ -377,14 +385,22 @@ export default function NewRequest() {
               {supervisors.map(s => <option key={s.id} value={s.id}>{s.full_name}</option>)}
             </Select></div>
           )}
-          <div className="sm:text-right">
-            <div className="text-[11px] font-medium uppercase tracking-[0.08em] text-ink-500">Request total</div>
-            <div className={`num text-[26px] leading-tight font-medium ${over ? 'text-brand-600' : 'text-ink-900'}`}>{money(total)}</div>
+          <div className="sm:text-right sm:min-w-[300px]">
+            <dl className="text-sm space-y-1.5 mb-3 pb-3 border-b border-ink-100">
+              <div className="flex justify-between gap-6"><dt className="text-ink-500">Parts, before VAT</dt><dd className="num text-ink-900">{money(total)}</dd></div>
+              <div className="flex justify-between gap-6">
+                <dt className="text-ink-500 text-left">VAT 15%{vat.qty > 0 && <span className="block text-[12px]">Line <span className="num">{contract.vat_line_number}</span> · quantity <span className="num">{fmtQty(vat.qty)}</span> × <span className="num">{money(contract.vat_line_value)}</span></span>}
+                  {taxable === 0 && <span className="block text-[12px]">No taxed parts on this request</span>}</dt>
+                <dd className="num text-ink-900">{vatMissing ? '—' : money(vat.amount)}</dd>
+              </div>
+            </dl>
+            <div className="text-[11px] font-medium uppercase tracking-[0.08em] text-ink-500">Request total, including VAT</div>
+            <div className={`num text-[26px] leading-tight font-medium ${over ? 'text-brand-600' : 'text-ink-900'}`}>{money(grandTotal)}</div>
             <div className="text-[12px] text-ink-500">{over ? 'Exceeds' : 'Within'} the remaining balance of <span className="num">{money(bal?.remaining)}</span></div>
           </div>
         </div>
         <div className="flex justify-end mt-5 pt-5 border-t border-ink-100">
-          <Btn size="lg" onClick={trySubmit} disabled={busy || cart.length === 0}>
+          <Btn size="lg" onClick={trySubmit} disabled={busy || cart.length === 0 || vatMissing}>
             {busy ? 'Saving…' : editId ? 'Save changes' : 'Submit request'}
           </Btn>
         </div>

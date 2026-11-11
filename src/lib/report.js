@@ -48,7 +48,7 @@ export function contractPdf({ contract, balance, items, requests }) {
         const tot = r.request_items.reduce((s, i) => s + i.quantity, 0)
         const got = r.request_items.reduce((s, i) => s + (i.received_quantity || 0), 0)
         return [r.request_number, r.engineer?.full_name || '', statusLabel(r.status), r.release_number || '—',
-          fmtDate(r.promise_date), `${got}/${tot}`, money(r.request_items.reduce((s, i) => s + i.unit_price * i.quantity, 0))]
+          fmtDate(r.promise_date), `${Number(got.toFixed(4))}/${Number(tot.toFixed(4))}`, money(r.request_items.reduce((s, i) => s + i.unit_price * i.quantity, 0))]
       }) })
   } else {
     doc.setFontSize(9); doc.setTextColor(140); doc.text('No requests yet.', 40, y + 14)

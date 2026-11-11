@@ -165,7 +165,7 @@ const lineError = (error) => /duplicate|unique/i.test(error.message)
   : error.message
 
 function NewContractModal({ open, onClose, vendors, onSaved, profile }) {
-  const empty = { contract_number: '', po_number: '', vendor_name: '', vendor_email: '', total_amount: '', previous_consumed_amount: '0', start_date: '', end_date: '' }
+  const empty = { contract_number: '', po_number: '', vendor_name: '', vendor_email: '', total_amount: '', previous_consumed_amount: '0', start_date: '', end_date: '', vat_line_number: '', vat_line_value: '' }
   const [f, setF] = useState(empty)
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
@@ -186,6 +186,8 @@ function NewContractModal({ open, onClose, vendors, onSaved, profile }) {
         contract_number: f.contract_number.trim(), po_number: f.po_number.trim(),
         vendor_id: vendorId, total_amount: Number(f.total_amount),
         previous_consumed_amount: Number(f.previous_consumed_amount || 0),
+        vat_line_number: f.vat_line_number === '' ? null : Number(f.vat_line_number),
+        vat_line_value: f.vat_line_value === '' ? null : Number(f.vat_line_value),
         start_date: f.start_date, end_date: f.end_date, created_by: profile.id,
       })
       if (error) throw error
@@ -217,11 +219,14 @@ function NewContractModal({ open, onClose, vendors, onSaved, profile }) {
         <Input label="Previously consumed" type="number" min="0" step="0.01" value={f.previous_consumed_amount} onChange={set('previous_consumed_amount')} />
         <Input label="Start date" type="date" value={f.start_date} onChange={set('start_date')} />
         <Input label="End date" type="date" value={f.end_date} onChange={set('end_date')} />
+        <Input label="VAT line number" type="number" min="1" value={f.vat_line_number} onChange={set('vat_line_number')} placeholder="Usually the last line" />
+        <Input label="VAT line value" type="number" min="0" step="0.01" value={f.vat_line_value} onChange={set('vat_line_value')} placeholder="Value of one unit" />
       </div>
       <p className="text-[13px] text-ink-500 mt-4">Previously consumed is what was spent on this contract before it was added here, so the remaining balance starts out correct.</p>
+      <p className="text-[13px] text-ink-500 mt-2">The VAT line is the contract line that VAT is released against. Leave both fields empty if no part on this contract is taxed.</p>
       <div className="flex justify-end gap-2 mt-6">
         <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
-        <Btn onClick={save} disabled={busy || !f.contract_number || !f.po_number || !f.vendor_name.trim() || !f.total_amount || !f.start_date || !f.end_date}>
+        <Btn onClick={save} disabled={busy || !f.contract_number || !f.po_number || !f.vendor_name.trim() || !f.total_amount || !f.start_date || !f.end_date || (f.vat_line_number === '') !== (f.vat_line_value === '')}>
           {busy ? 'Saving…' : 'Save contract'}
         </Btn>
       </div>
@@ -261,6 +266,8 @@ function VendorsModal({ open, onClose, vendors }) {
 function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
   const [showAdd, setShowAdd] = useState(false)
   const [editItem, setEditItem] = useState(null)
+  const [showVat, setShowVat] = useState(false)
+  const [vat, setVat] = useState({ number: contract.vat_line_number, value: contract.vat_line_value })
   const [excelRows, setExcelRows] = useState(null)
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
@@ -304,7 +311,7 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
   // Empty Excel sheet with the columns in the order the upload expects.
   const downloadTemplate = async () => {
     const XLSX = await import('xlsx')
-    const cols = ['Line Number', 'Description', 'Part Number', 'Unit Price', 'Model', 'VAT (Yes/No)']
+    const cols = ['Line Number', 'Description', 'Part Number', 'Unit Price (before VAT)', 'Model', 'VAT (Yes/No)']
     const sheet = XLSX.utils.aoa_to_sheet([cols])
     sheet['!cols'] = [{ wch: 13 }, { wch: 46 }, { wch: 20 }, { wch: 14 }, { wch: 24 }, { wch: 14 }]
     const help = XLSX.utils.aoa_to_sheet([
@@ -314,9 +321,11 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
       ['Line Number', 'Yes', 'The line number from the contract. Each number once per contract.', 1],
       ['Description', 'Yes', 'Part description as written in the contract.', 'Flow sensor, Infinity ID'],
       ['Part Number', 'Yes', 'Vendor part number.', '8403735'],
-      ['Unit Price', 'Yes', 'Price of one unit, numbers only.', 1450],
+      ['Unit Price (before VAT)', 'Yes', 'Price of one unit before VAT, numbers only.', 1450],
       ['Model', 'No', 'Device model the part belongs to. It is filled in automatically on requests.', 'Evita V500'],
       ['VAT (Yes/No)', 'No', 'Yes if VAT applies to the part, No if it does not. Empty counts as No.', 'Yes'],
+      [],
+      ['Do not add the VAT line here. Its line number and value are set on the contract itself.'],
       [],
       ['Keep the first row (the column titles) and do not change the column order.'],
       ['Start typing from row 2, one part per row. Only the first sheet is read.'],
@@ -381,6 +390,15 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
           <span className="inline-flex items-center gap-1.5"><i className="w-2.5 h-2.5 rounded-sm bg-ink-900" />Committed in requests</span>
           <span className="inline-flex items-center gap-1.5"><i className="w-2.5 h-2.5 rounded-sm bg-olive-100 border border-olive-500/40" />Remaining</span>
         </div>
+        <div className="flex flex-wrap items-center justify-between gap-3 mt-5 pt-4 border-t border-ink-100">
+          <div className="text-sm">
+            <span className="text-[11px] font-medium uppercase tracking-[0.08em] text-ink-500 mr-3">VAT line</span>
+            {vat.number
+              ? <span className="text-ink-900">Line <span className="num">{vat.number}</span> · <span className="num">{money(vat.value)}</span> per unit</span>
+              : <span className="text-ink-500">Not set. Requests with taxed parts cannot be submitted until it is.</span>}
+          </div>
+          {canEdit && <Btn size="sm" variant="secondary" onClick={() => setShowVat(true)}>{vat.number ? 'Edit VAT line' : 'Set VAT line'}</Btn>}
+        </div>
       </Card>
 
       {excelRows && (
@@ -391,7 +409,7 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
               <Btn onClick={importExcel} disabled={busy}>{busy ? 'Importing…' : `Import ${excelRows.length} line items`}</Btn>
             </div>} />
           <TableWrap>
-            <thead><tr><Th>Line</Th><Th>Description</Th><Th>Part number</Th><Th>Model</Th><Th>VAT</Th><Th right>Unit price</Th></tr></thead>
+            <thead><tr><Th>Line</Th><Th>Description</Th><Th>Part number</Th><Th>Model</Th><Th>VAT</Th><Th right>Unit price before VAT</Th></tr></thead>
             <tbody>{excelRows.slice(0, 8).map((r, i) => <tr key={i}><Td className="num">{r.line_number}</Td><Td>{r.description}</Td><Td className="num text-[13px]">{r.part_number}</Td><Td>{r.device_model || <span className="text-ink-300">—</span>}</Td><Td><VatBadge on={r.taxable} /></Td><Td right className="num">{money(r.unit_price)}</Td></tr>)}</tbody>
           </TableWrap>
           {excelRows.length > 8 && <div className="text-[13px] text-ink-500 px-5 py-3">and {excelRows.length - 8} more rows</div>}
@@ -399,7 +417,7 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
       )}
 
       <Card className="overflow-hidden">
-        <SectionHead title={`Line items · ${items.length}`} hint={canEdit ? 'Download the Excel template, fill one part per row, then upload it.' : undefined}
+        <SectionHead title={`Line items · ${items.length}`} hint={canEdit ? 'All prices are before VAT. Download the Excel template, fill one part per row, then upload it.' : 'All prices are before VAT.'}
           right={canEdit && <div className="flex flex-wrap gap-2">
             <Btn variant="ghost" icon="download" onClick={downloadTemplate}>Excel template</Btn>
             <label className="inline-flex items-center justify-center gap-2 h-9.5 px-4 rounded-lg text-sm font-medium bg-white hover:bg-ink-50 text-ink-800 border border-ink-300 cursor-pointer transition-colors">
@@ -410,7 +428,7 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
           </div>} />
         {items.length === 0 ? <Empty icon="box" title="No line items yet" hint="Download the Excel template, fill it and upload it, or add line items one by one." /> : (
           <TableWrap>
-            <thead><tr><Th className="w-16">Line</Th><Th className="w-16">Image</Th><Th>Description</Th><Th>Part number</Th><Th>Model</Th><Th>VAT</Th><Th right>Unit price</Th>{canEdit && <Th></Th>}</tr></thead>
+            <thead><tr><Th className="w-16">Line</Th><Th className="w-16">Image</Th><Th>Description</Th><Th>Part number</Th><Th>Model</Th><Th>VAT</Th><Th right>Unit price before VAT</Th>{canEdit && <Th></Th>}</tr></thead>
             <tbody>
               {items.map(it => (
                 <tr key={it.id}>
@@ -440,9 +458,43 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
           </TableWrap>
         )}
       </Card>
+      <VatLineModal open={showVat} contract={contract} vat={vat} onClose={() => setShowVat(false)}
+        onSaved={(v) => { setVat(v); contract.vat_line_number = v.number; contract.vat_line_value = v.value; setShowVat(false) }} />
       <ItemModal open={showAdd || !!editItem} item={editItem} contract={contract}
         onClose={() => { setShowAdd(false); setEditItem(null) }} onSaved={() => { setShowAdd(false); setEditItem(null); reload() }} />
     </div>
+  )
+}
+
+function VatLineModal({ open, onClose, contract, vat, onSaved }) {
+  const [f, setF] = useState({ number: '', value: '' })
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
+  useEffect(() => { if (open) { setErr(''); setF({ number: vat.number ?? '', value: vat.value ?? '' }) } }, [open, vat])
+  const both = f.number !== '' && f.value !== '' && Number(f.value) > 0
+  const none = f.number === '' && f.value === ''
+  const save = async () => {
+    setErr(''); setBusy(true)
+    const v = none ? { number: null, value: null } : { number: Number(f.number), value: Number(f.value) }
+    const { error } = await supabase.from('contracts').update({ vat_line_number: v.number, vat_line_value: v.value }).eq('id', contract.id)
+    setBusy(false)
+    if (error) return setErr(error.message)
+    onSaved(v)
+  }
+  return (
+    <Modal open={open} onClose={onClose} title="VAT line">
+      {err && <Alert>{err}</Alert>}
+      <p className="text-sm text-ink-600 mb-4">VAT is released against its own contract line. On each request the system adds this line with a quantity equal to the VAT due (15% of the taxed parts) divided by the line value.</p>
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Input label="VAT line number" type="number" min="1" value={f.number} onChange={e => setF(x => ({ ...x, number: e.target.value }))} />
+        <Input label="VAT line value" type="number" min="0" step="0.01" value={f.value} onChange={e => setF(x => ({ ...x, value: e.target.value }))} />
+      </div>
+      {both && <p className="num text-[12px] text-ink-500 mt-3">Example: VAT due 50.00 gives quantity {String(Number((50 / Number(f.value)).toFixed(4)))}</p>}
+      <div className="flex justify-end gap-2 mt-6">
+        <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
+        <Btn onClick={save} disabled={busy || !(both || none)}>Save VAT line</Btn>
+      </div>
+    </Modal>
   )
 }
 
@@ -480,7 +532,7 @@ function ItemModal({ open, onClose, contract, onSaved, item }) {
         <Input label="Part number" value={f.part_number} onChange={set('part_number')} />
         <div className="sm:col-span-2"><Input label="Description" value={f.description} onChange={set('description')} /></div>
         <Input label="Model" value={f.device_model} onChange={set('device_model')} placeholder="ASTRAL 150" />
-        <Input label="Unit price" type="number" min="0" step="0.01" value={f.unit_price} onChange={set('unit_price')} />
+        <Input label="Unit price before VAT" type="number" min="0" step="0.01" value={f.unit_price} onChange={set('unit_price')} />
         <label className={`sm:col-span-2 flex items-center gap-3 px-4 py-3 rounded-lg border cursor-pointer transition-colors ${f.taxable ? 'border-ink-900 bg-ink-50' : 'border-ink-200 hover:border-ink-400'}`}>
           <input type="checkbox" checked={f.taxable} onChange={e => setF(x => ({ ...x, taxable: e.target.checked }))} className="w-4 h-4 accent-brand-600" />
           <span>

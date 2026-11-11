@@ -33,7 +33,7 @@ export default function Reports() {
 
   // most requested parts
   const parts = {}
-  for (const r of reqs) for (const i of r.request_items) {
+  for (const r of reqs) for (const i of r.request_items.filter(x => !x.is_vat)) {
     const k = i.part_number
     parts[k] = parts[k] || { part: i.part_number, desc: i.description, count: 0, qty: 0 }
     parts[k].count += 1; parts[k].qty += i.quantity
