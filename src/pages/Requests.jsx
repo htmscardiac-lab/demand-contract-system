@@ -5,10 +5,11 @@ import { useApp } from '../App.jsx'
 import { usePoll } from '../lib/poll.js'
 import { Card, Btn, Input, Select, Textarea, Badge, Modal, Drawer, Spinner, Empty, PageTitle, Alert, TableWrap, Th, Td, Row,
          Tabs, SearchInput, Field, Meter, Icon } from '../ui.jsx'
+import { MrrModal, MrrReminderModal, unlinkedReceipts } from '../lib/mrr.jsx'
 import { money, fmtDate, fmtDateTime, STATUS_STYLE, statusLabel, receiptLabel, actionFor, requestTotal, isOverdue, fmtQty, groupByDevice, groupByPart,
          ACTIVE_STATUSES, DONE_STATUSES, buildTimeline, buildApprovalEmail, downloadOutlookEmail } from '../lib/helpers'
 
-export const REQUEST_QUERY = `*, request_items(*),
+export const REQUEST_QUERY = `*, request_items(*), request_receipts(*), mrrs(*),
   contracts(id, contract_number, po_number, vendors(name, vendor_contacts(name, email, phone))),
   engineer:profiles!requests_engineer_id_fkey(id, full_name),
   supervisor:profiles!requests_supervisor_id_fkey(id, full_name)`
@@ -182,6 +183,10 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
   })
   const [complete, setComplete] = useState({ release_number: r.release_number || '', promise_date: r.promise_date || '' })
   const [items, setItems] = useState(r.request_items)
+  const [receipts, setReceipts] = useState(r.request_receipts || [])
+  const [mrrs, setMrrs] = useState(r.mrrs || [])
+  const [mrrOpen, setMrrOpen] = useState(false)
+  const [remind, setRemind] = useState(false)
   const [status, setStatus] = useState(r.status)
   const [reason, setReason] = useState('')
   const [modal, setModal] = useState(null)
@@ -192,7 +197,9 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
   const [ok, setOk] = useState('')
   const [busy, setBusy] = useState(false)
 
-  const view = { ...r, request_items: items, status }
+  const view = { ...r, request_items: items, request_receipts: receipts, mrrs, status }
+  const noMrr = unlinkedReceipts(view)
+  const canMrr = profile.role === 'clinical_engineer' || profile.role === 'admin'
   const total = items.reduce((s, i) => s + i.unit_price * i.quantity, 0)
   const parts = items.filter(i => !i.is_vat)
   const vatLine = items.find(i => i.is_vat)
@@ -234,6 +241,12 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
   const refresh = async () => {
     const { data } = await supabase.from('request_items').select('*').eq('request_id', r.id).order('id')
     if (data) setItems(data)
+    const [{ data: rc }, { data: mr }] = await Promise.all([
+      supabase.from('request_receipts').select('*').eq('request_id', r.id).order('id'),
+      supabase.from('mrrs').select('*').eq('request_id', r.id).order('id'),
+    ])
+    if (rc) setReceipts(rc)
+    if (mr) setMrrs(mr)
     const { data: rq } = await supabase.from('requests').select('status, release_number, promise_date').eq('id', r.id).single()
     if (rq) { setStatus(rq.status); r.release_number = rq.release_number; r.promise_date = rq.promise_date }
   }
@@ -418,6 +431,51 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
         </ul>
       </Card>
 
+      {canTrack && receipts.length > 0 && (
+        <Card className="overflow-hidden">
+          <div className="flex flex-wrap items-center justify-between gap-3 px-5 py-3.5 border-b border-ink-100">
+            <div>
+              <h4 className="font-display font-semibold text-[13px] tracking-[0.08em] uppercase text-ink-500">MRR</h4>
+              <p className={`text-[13px] mt-0.5 ${noMrr.length ? 'text-brand-700 font-medium' : 'text-ink-500'}`}>
+                {noMrr.length ? `${noMrr.length} received line${noMrr.length === 1 ? '' : 's'} without an MRR` : 'Every received line has an MRR'}
+                {status !== 'closed' && <span className="block font-normal text-ink-500">The request closes when every line is received and covered by an MRR.</span>}
+              </p>
+            </div>
+            {canMrr && noMrr.length > 0 && (
+              <div className="flex gap-2">
+                <Btn size="sm" variant="secondary" icon="mail" onClick={() => setRemind(true)}>Reminder email</Btn>
+                <Btn size="sm" onClick={() => setMrrOpen(true)}>Generate MRR</Btn>
+              </div>
+            )}
+          </div>
+          {mrrs.length === 0 ? <p className="px-5 py-4 text-[13px] text-ink-500">No MRR recorded yet.</p> : (
+            <ul>
+              {mrrs.map(m => {
+                const mine = receipts.filter(x => x.mrr_id === m.id)
+                const byId = Object.fromEntries(items.map(i => [i.id, i]))
+                return (
+                  <li key={m.id} className="px-5 py-3.5 border-b border-ink-100 last:border-0">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="text-sm"><span className="num font-medium text-ink-900">{m.mrr_number}</span><span className="text-ink-500"> · {fmtDate(m.mrr_date)} · {mine.length} line{mine.length === 1 ? '' : 's'}</span></div>
+                      {canMrr && <button onClick={() => call('delete_mrr', { p_mrr_id: m.id }, `MRR ${m.mrr_number} removed. Its lines are back to no MRR.`, refresh)} disabled={busy}
+                        className="text-[13px] font-medium text-ink-500 hover:text-brand-700 hover:underline">Remove MRR</button>}
+                    </div>
+                    <ul className="mt-2 text-[13px] text-ink-600 space-y-0.5">
+                      {mine.map(x => { const it = byId[x.request_item_id]; return it && (
+                        <li key={x.id} className="flex justify-between gap-4">
+                          <span className="truncate">{it.is_vat ? 'VAT line' : it.description} <span className="num text-ink-400">· Line {it.line_number}</span></span>
+                          <span className="num shrink-0">{fmtQty(x.quantity)}</span>
+                        </li>
+                      ) })}
+                    </ul>
+                  </li>
+                )
+              })}
+            </ul>
+          )}
+        </Card>
+      )}
+
       {canTrack && (
         <Card className="p-5">
           <div className="flex items-center gap-3 mb-4">
@@ -442,6 +500,10 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
           )}
         </Card>
       )}
+
+      <MrrModal request={mrrOpen ? view : null} onClose={() => setMrrOpen(false)}
+        onSaved={(n) => { setMrrOpen(false); setOk(`MRR ${n} recorded.`); refresh() }} />
+      <MrrReminderModal requests={remind ? [view] : null} settings={settings} onClose={() => setRemind(false)} />
 
       <Modal open={modal === 'reject'} onClose={() => setModal(null)} title="Reject request">
         <Textarea label="Reason for rejection" rows={3} value={reason} onChange={e => setReason(e.target.value)} placeholder="The engineer sees this reason." />

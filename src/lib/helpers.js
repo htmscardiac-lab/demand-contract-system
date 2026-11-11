@@ -96,7 +96,7 @@ export function buildTimeline(r) {
     { key: 'in_process', label: 'In process', at: null, desc: r.release_number ? `Release ${r.release_number}` : 'release issued' },
     { key: 'approved', label: 'Approved', at: null, desc: 'release approved' },
     { key: 'receiving', label: 'Receiving parts', at: null, desc: 'goods receipt' },
-    { key: 'closed', label: 'Closed', at: null, desc: 'fully received' },
+    { key: 'closed', label: 'Closed', at: null, desc: 'received, MRR done' },
   ]
   return stages.map(st => {
     const pos = order.indexOf(st.key)
@@ -179,8 +179,8 @@ export function buildApprovalEmail(req, settings = {}) {
 // RFC 2047 header value, so the dash in the subject survives in Outlook
 const encHeader = (v) => '=?UTF-8?B?' + btoa(String.fromCharCode(...new TextEncoder().encode(v))) + '?='
 
-export function downloadOutlookEmail(req, settings = {}) {
-  const { subject, html, body, to, cc } = buildApprovalEmail(req, settings)
+// Saves a ready-to-send Outlook message (.eml) with a plain-text and an HTML version.
+export function downloadEml({ to = [], cc = '', subject, body, html, filename }) {
   const boundary = '----=_DCS_' + Date.now()
   const eml = [
     `To: ${to.join(', ')}`, ...(cc ? [`Cc: ${cc}`] : []), `Subject: ${encHeader(subject)}`, 'X-Unsent: 1', 'MIME-Version: 1.0',
@@ -192,7 +192,13 @@ export function downloadOutlookEmail(req, settings = {}) {
   const blob = new Blob([eml], { type: 'message/rfc822' })
   const url = URL.createObjectURL(blob)
   const a = document.createElement('a')
-  a.href = url; a.download = `${req.request_number}.eml`
+  a.href = url; a.download = filename
   document.body.appendChild(a); a.click(); document.body.removeChild(a)
   setTimeout(() => URL.revokeObjectURL(url), 3000)
 }
+
+export function downloadOutlookEmail(req, settings = {}) {
+  const { subject, html, body, to, cc } = buildApprovalEmail(req, settings)
+  downloadEml({ to, cc, subject, body, html, filename: `${req.request_number}.eml` })
+}
+export const escHtml = esc

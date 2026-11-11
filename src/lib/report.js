@@ -78,3 +78,19 @@ export function allContractsPdf({ contracts, balances, requests }) {
   footer(doc)
   doc.save('All-contracts-summary.pdf')
 }
+
+// Lines received but not yet covered by an MRR. rows: output of pendingMrrRows() in lib/mrr.jsx
+export function mrrPendingPdf({ rows, scope }) {
+  const doc = new jsPDF({ unit: 'pt', format: 'a4', orientation: 'landscape' })
+  header(doc, 'Received lines without MRR', scope || 'All vendors')
+  autoTable(doc, { startY: 96, headStyles: { fillColor: [20, 23, 28] }, styles: { fontSize: 8, cellPadding: 4 },
+    head: [['Vendor', 'Request', 'P.O – Release', 'Line', 'Description', 'Part number', 'Qty received', 'Received on', 'Days waiting']],
+    body: rows.map(x => [x.vendor, x.request_number, x.ref, x.line_number ?? '', x.description, x.part_number, x.qty, fmtDate(x.received_at), x.days]) })
+  const n = doc.internal.getNumberOfPages()
+  for (let i = 1; i <= n; i++) {
+    doc.setPage(i); doc.setFontSize(8); doc.setTextColor(150)
+    doc.text(`Generated ${new Date().toLocaleString('en-GB')}`, 40, 575)
+    doc.text(`Page ${i} of ${n}`, 760, 575)
+  }
+  doc.save(`received-without-mrr-${new Date().toISOString().slice(0, 10)}.pdf`)
+}

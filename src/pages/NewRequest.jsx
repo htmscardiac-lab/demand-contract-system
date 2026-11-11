@@ -41,6 +41,7 @@ export default function NewRequest() {
   const [bal, setBal] = useState(null)
   const [items, setItems] = useState([])
   const [search, setSearch] = useState('')
+  const [model, setModel] = useState('')            // optional filter of the parts by device model
   const [devices, setDevices] = useState(() => [newDevice()])
   const [active, setActive] = useState(0)
   const [supervisors, setSupervisors] = useState([])
@@ -114,7 +115,7 @@ export default function NewRequest() {
       supabase.from('contract_balances').select('*').eq('contract_id', c.id).single(),
       supabase.from('contract_items').select('*').eq('contract_id', c.id).order('line_number'),
     ])
-    setBal(b); setItems(ci || []); setDevices([newDevice()]); setActive(0); setStep('parts')
+    setBal(b); setItems(ci || []); setDevices([newDevice()]); setActive(0); setModel(''); setSearch(''); setStep('parts')
   }
 
   // ---- devices and their parts
@@ -148,8 +149,9 @@ export default function NewRequest() {
   const vat = vatFor(taxable, contract?.vat_line_value)
   const grandTotal = total + vat.amount
 
-  const filtered = items.filter(i =>
-    !search || i.description.toLowerCase().includes(search.toLowerCase()) || i.part_number.toLowerCase().includes(search.toLowerCase()))
+  const models = useMemo(() => [...new Set(items.map(i => (i.device_model || '').trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b)), [items])
+  const filtered = items.filter(i => (!model || (i.device_model || '').trim() === model) &&
+    (!search || i.description.toLowerCase().includes(search.toLowerCase()) || i.part_number.toLowerCase().includes(search.toLowerCase())))
 
   // first problem with the devices, and which device it is on
   const deviceProblem = () => {
@@ -373,9 +375,18 @@ export default function NewRequest() {
 
         <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
           <h2 className="font-display font-semibold text-[15px] tracking-wide uppercase text-ink-900">Parts for {deviceName(d, active)}</h2>
-          <SearchInput className="w-full sm:w-80" placeholder="Search by description or part number" value={search} onChange={e => setSearch(e.target.value)} aria-label="Search parts" />
+          <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+            {models.length > 0 && (
+              <select value={model} onChange={e => setModel(e.target.value)} aria-label="Filter by model"
+                className="h-9.5 rounded-lg border border-ink-300 bg-white px-3 pr-8 text-sm text-ink-800 focus:outline-none focus:border-brand-600 focus:ring-3 focus:ring-brand-100">
+                <option value="">All models</option>
+                {models.map(m => <option key={m} value={m}>{m}</option>)}
+              </select>
+            )}
+            <SearchInput className="flex-1 sm:w-72" placeholder="Search by description or part number" value={search} onChange={e => setSearch(e.target.value)} aria-label="Search parts" />
+          </div>
         </div>
-        {filtered.length === 0 ? <Card><Empty icon="search" title={items.length ? 'No parts match' : 'This contract has no line items yet'} hint={items.length ? 'Try a different description or part number.' : 'A supervisor needs to add the line items to the contract first.'} /></Card> : (
+        {filtered.length === 0 ? <Card><Empty icon="search" title={items.length ? 'No parts match' : 'This contract has no line items yet'} hint={items.length ? 'Try a different description, part number or model.' : 'A supervisor needs to add the line items to the contract first.'} /></Card> : (
           <div className="grid gap-4 grid-cols-2 md:grid-cols-3 xl:grid-cols-4">
             {filtered.map(it => {
               const qty = d.lines.find(l => l.item.id === it.id)?.quantity || 0

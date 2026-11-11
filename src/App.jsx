@@ -12,6 +12,7 @@ const Contracts = lazy(() => import('./pages/Contracts.jsx'))
 const NewRequest = lazy(() => import('./pages/NewRequest.jsx'))
 const Reports = lazy(() => import('./pages/Reports.jsx'))
 const Vendors = lazy(() => import('./pages/Vendors.jsx'))
+const Mrr = lazy(() => import('./pages/Mrr.jsx'))
 const Admin = lazy(() => import('./pages/Admin.jsx'))
 
 const Ctx = createContext(null)
@@ -103,6 +104,7 @@ function Sidebar({ counts, onNavigate }) {
     { label: 'Workspace', links: [
       { to: '/', label: 'Overview', icon: 'overview' },
       { to: '/requests', label: 'Requests', icon: 'requests', badge: counts.action },
+      ...(['clinical_engineer', 'admin'].includes(role) ? [{ to: '/mrr', label: 'MRR', icon: 'box', badge: counts.mrr }] : []),
       { to: '/contracts', label: 'Contracts', icon: 'contracts' },
       { to: '/vendors', label: 'Vendors', icon: 'users' },
     ] },
@@ -170,12 +172,18 @@ function Sidebar({ counts, onNavigate }) {
 function Layout({ children }) {
   const { profile, settings } = useApp()
   const [drawer, setDrawer] = useState(false)
-  const [counts, setCounts] = useState({ action: 0 })
+  const [counts, setCounts] = useState({ action: 0, mrr: 0 })
   const location = useLocation()
 
   usePoll(async () => {
     const { data } = await supabase.from('requests').select('status, archived, supervisor_id, engineer_id')
-    setCounts({ action: (data || []).filter(r => actionFor(r, profile)).length })
+    // requests with received lines that still have no MRR (shown to clinical engineers and administrators)
+    let mrr = 0
+    if (['clinical_engineer', 'admin'].includes(profile.role)) {
+      const { data: rc } = await supabase.from('request_receipts').select('request_id, mrr_id').is('mrr_id', null)
+      mrr = new Set((rc || []).map(x => x.request_id)).size
+    }
+    setCounts({ action: (data || []).filter(r => actionFor(r, profile)).length, mrr })
   }, 8000, [profile.id, profile.role])
 
   useEffect(() => { setDrawer(false) }, [location.pathname])
@@ -265,6 +273,7 @@ export default function App() {
           <Route path="/approvals" element={<Navigate to="/requests" replace />} />
           <Route path="/clinical" element={<Navigate to="/requests" replace />} />
           <Route path="/vendors" element={<Vendors />} />
+          <Route path="/mrr" element={['clinical_engineer', 'admin'].includes(profile.role) ? <Mrr /> : <Navigate to="/" replace />} />
           <Route path="/reports" element={<Reports />} />
           <Route path="/admin" element={profile.role === 'admin' ? <Admin /> : <Navigate to="/" replace />} />
           <Route path="*" element={<Navigate to="/" replace />} />
