@@ -102,6 +102,7 @@ create table if not exists public.requests (
                                         'closed','returned','rejected','cancelled')),
   rejection_reason    text,
   return_reason       text,
+  return_notes        jsonb,          -- notes per line from the last return
   submitted_at        timestamptz not null default now(),
   decided_at          timestamptz,
   returned_at         timestamptz,
@@ -202,6 +203,7 @@ alter table public.request_items  add column if not exists taxable boolean not n
 alter table public.contract_items add column if not exists equipment_description text;
 alter table public.vendor_contacts add column if not exists position text;
 alter table public.vendor_contacts add column if not exists specialties text[] not null default '{}';
+alter table public.requests add column if not exists return_notes jsonb;
 alter table public.contracts add column if not exists vat_line_number integer;
 alter table public.contracts add column if not exists vat_line_value numeric(14,2) check (vat_line_value > 0);
 alter table public.request_items add column if not exists is_vat boolean not null default false;
@@ -518,7 +520,7 @@ language sql security definer set search_path = public as $$
          ci.taxable
   from jsonb_array_elements(p_items) with ordinality as x(it, ord)
   join contract_items ci on ci.id = (it->>'contract_item_id')::bigint and ci.contract_id = p_contract_id
-  order by ord;
+  order by ci.line_number, ord;   -- lines are stored in contract line order
 
   -- the VAT line, added automatically when any requested part is taxable
   insert into request_items(request_id, contract_item_id, part_number, description, unit_price, quantity,
@@ -664,29 +666,6 @@ begin
   end if;
 end $$;
 
-create or replace function public.return_request(p_request_id bigint, p_reason text)
-returns void language plpgsql security definer set search_path = public as $$
-declare r requests;
-begin
-  select * into r from requests where id = p_request_id for update;
-  if r.id is null then raise exception 'Request not found.'; end if;
-  if coalesce(trim(p_reason), '') = '' then raise exception 'A reason for returning the request is required.'; end if;
-  if r.status = 'pending' then
-    if not (is_admin() or (r.supervisor_id = auth.uid() and is_active_user())) then
-      raise exception 'Only the request''s supervisor can return it at this stage.';
-    end if;
-  elsif r.status = 'pending_clinical' then
-    if not (is_admin() or is_clinical()) then
-      raise exception 'Only a clinical engineer can return the request at this stage.';
-    end if;
-  else
-    raise exception 'This request cannot be returned in its current status.';
-  end if;
-  update requests set status = 'returned', return_reason = trim(p_reason), returned_at = now() where id = p_request_id;
-  perform notify_user(r.engineer_id, 'request_returned',
-    format('Request %s was returned to you for amendment. Reason: %s', r.request_number, trim(p_reason)), r.id);
-end $$;
-
 create or replace function public.decide_request(p_request_id bigint, p_decision text, p_reason text default null)
 returns void language plpgsql security definer set search_path = public as $$
 declare r requests; total numeric;
@@ -719,39 +698,6 @@ begin
   end if;
 end $$;
 
-create or replace function public.complete_request(p_request_id bigint, p_release_number text, p_promise_date text)
-returns void language plpgsql security definer set search_path = public as $$
-declare r requests;
-begin
-  select * into r from requests where id = p_request_id for update;
-  if r.id is null then raise exception 'Request not found.'; end if;
-  if not (is_admin() or is_clinical()) then
-    raise exception 'Only a clinical engineer (or an admin) can complete a request.';
-  end if;
-  if r.status <> 'pending_clinical' then raise exception 'This request is not awaiting procurement completion.'; end if;
-  if coalesce(trim(p_release_number), '') = '' then raise exception 'Release number is required to complete the request.'; end if;
-  if coalesce(p_promise_date, '') = '' then raise exception 'Promise date is required to complete the request.'; end if;
-  update requests set status = 'in_process', release_number = trim(p_release_number),
-         promise_date = p_promise_date::date, release_status = 'in_process' where id = p_request_id;
-  perform notify_user(u, 'request_completed',
-    format('Request %s is now in process. Release %s, promise date %s.', r.request_number, trim(p_release_number), p_promise_date), r.id)
-  from (select distinct unnest(array[r.engineer_id, r.supervisor_id]) as u) x;
-end $$;
-
-create or replace function public.approve_final(p_request_id bigint)
-returns void language plpgsql security definer set search_path = public as $$
-declare r requests;
-begin
-  select * into r from requests where id = p_request_id for update;
-  if r.id is null then raise exception 'Request not found.'; end if;
-  if not can_view_request(r.engineer_id, r.supervisor_id) then raise exception 'You do not have access to this request.'; end if;
-  if r.status <> 'in_process' then raise exception 'Only a request that is in process can be marked approved.'; end if;
-  update requests set status = 'approved', release_status = 'approved' where id = p_request_id;
-  perform notify_user(u, 'request_final_approved',
-    format('Request %s is approved. The release email is ready.', r.request_number), r.id)
-  from (select distinct unnest(array[r.engineer_id, r.supervisor_id]) as u) x;
-end $$;
-
 create or replace function public.update_tracking(p_request_id bigint, p_release_number text default null,
   p_release_status text default null, p_promise_date text default null, p_last_followup_date text default null)
 returns void language plpgsql security definer set search_path = public as $$
@@ -770,19 +716,55 @@ begin
    where id = p_request_id;
 end $$;
 
+
+-- N working days after a date. Working week is Sunday to Thursday.
+create or replace function public.add_working_days(p_from date, p_days integer) returns date
+language plpgsql immutable as $$
+declare d date := p_from; n integer := 0;
+begin
+  while n < p_days loop
+    d := d + 1;
+    if extract(dow from d) not in (5, 6) then n := n + 1; end if;   -- 5 = Friday, 6 = Saturday
+  end loop;
+  return d;
+end $$;
+
+-- The VAT line is received automatically: 15% of the taxed parts received so far,
+-- as a quantity of the VAT line. It is complete when every taxed part is complete.
+create or replace function public._sync_vat(p_request_id bigint) returns void
+language plpgsql security definer set search_path = public as $$
+declare v request_items; tx numeric; done boolean; nv numeric;
+begin
+  select * into v from request_items where request_id = p_request_id and is_vat limit 1;
+  if v.id is null then return; end if;
+  select coalesce(sum(unit_price * received_quantity), 0), coalesce(bool_and(received_quantity >= quantity), true)
+    into tx, done from request_items where request_id = p_request_id and taxable and not is_vat;
+  nv := case when done then v.quantity else least(v.quantity, round(round(tx * 0.15, 2) / v.unit_price, 4)) end;
+  update request_items set received_quantity = nv,
+         received_at = case when nv >= v.quantity then coalesce(received_at, now()) else null end
+   where id = v.id;
+end $$;
+
+-- Complete: every part fully received. Archived: complete and every receipt covered by an MRR.
 create or replace function public._maybe_close(p_request_id bigint) returns void
 language plpgsql security definer set search_path = public as $$
 declare r requests;
 begin
-  -- a request closes when every line is fully received and every receipt is covered by an MRR
-  if exists (select 1 from request_items where request_id = p_request_id and received_quantity < quantity) then return; end if;
-  if exists (select 1 from request_receipts where request_id = p_request_id and mrr_id is null) then return; end if;
-  select * into r from requests where id = p_request_id and status = 'approved';
-  if r.id is null then return; end if;
-  update requests set status = 'closed' where id = p_request_id;
-  perform notify_user(u, 'items_received',
-    format('Request %s is fully received, covered by MRR, and closed.', r.request_number), r.id)
-  from (select distinct unnest(array[r.engineer_id, r.supervisor_id]) as u) x;
+  if exists (select 1 from request_items where request_id = p_request_id and not is_vat and received_quantity < quantity) then return; end if;
+  select * into r from requests where id = p_request_id;
+  if r.status = 'approved' then
+    update requests set status = 'closed' where id = p_request_id;
+    r.status := 'closed';
+    perform notify_user(u, 'items_received',
+      format('Request %s is fully received and complete. It is archived once its MRR is recorded.', r.request_number), r.id)
+    from (select distinct unnest(array[r.engineer_id, r.supervisor_id]) as u) x;
+    perform notify_clinical_pool('mrr_needed', format('Request %s is fully received and waiting for its MRR.', r.request_number), r.id);
+  end if;
+  if r.status = 'closed' and not r.archived
+     and exists (select 1 from request_receipts where request_id = p_request_id)
+     and not exists (select 1 from request_receipts where request_id = p_request_id and mrr_id is null) then
+    update requests set archived = true where id = p_request_id;
+  end if;
 end $$;
 
 drop function if exists public.receive_items(bigint, integer);
@@ -796,11 +778,12 @@ begin
   if not can_view_request(r.engineer_id, r.supervisor_id) then
     raise exception 'You do not have permission to receive items on this request.';
   end if;
-  if r.status not in ('in_process','approved','closed') then
-    raise exception 'Items can only be received on processed requests.';
+  if r.status not in ('in_process','approved') then
+    raise exception 'Items can only be received while the request is in process or approved.';
   end if;
+  if it.is_vat then raise exception 'The VAT line is received automatically with its parts.'; end if;
   if p_quantity is null or p_quantity <= 0 then raise exception 'Received quantity must be more than zero.'; end if;
-  if not it.is_vat and p_quantity <> trunc(p_quantity) then raise exception 'Parts are received in whole units.'; end if;
+  if p_quantity <> trunc(p_quantity) then raise exception 'Parts are received in whole units.'; end if;
   nv := it.received_quantity + p_quantity;
   if nv > it.quantity then
     raise exception 'Received quantity (%) would exceed the requested quantity (%). Outstanding: %.',
@@ -810,10 +793,149 @@ begin
          received_at = case when nv >= it.quantity then now() else null end,
          received_by = auth.uid()
    where id = p_item_id;
+  -- the receipt log: who received what and when
   insert into request_receipts(request_id, request_item_id, quantity, received_by)
     values (r.id, p_item_id, p_quantity, auth.uid());
+  perform _sync_vat(r.id);
   perform _maybe_close(r.id);
   return jsonb_build_object('received', nv, 'outstanding', it.quantity - nv, 'fully_received', nv >= it.quantity);
+end $$;
+
+-- Record a receipt for several lines at once: [{"item_id": 12, "quantity": 2}, ...]. All or nothing.
+create or replace function public.receive_lines(p_request_id bigint, p_lines jsonb)
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare l jsonb; n integer := 0;
+begin
+  if p_lines is null or jsonb_typeof(p_lines) <> 'array' or jsonb_array_length(p_lines) = 0 then
+    raise exception 'Select at least one line to receive.';
+  end if;
+  for l in select * from jsonb_array_elements(p_lines) loop
+    if not exists (select 1 from request_items where id = (l->>'item_id')::bigint and request_id = p_request_id) then
+      raise exception 'A selected line is not on this request.';
+    end if;
+    perform receive_items((l->>'item_id')::bigint, (l->>'quantity')::numeric);
+    n := n + 1;
+  end loop;
+  return jsonb_build_object('lines', n);
+end $$;
+
+create or replace function public.receive_all(p_request_id bigint)
+returns void language plpgsql security definer set search_path = public as $$
+declare r requests; it record;
+begin
+  select * into r from requests where id = p_request_id;
+  if r.id is null then raise exception 'Request not found.'; end if;
+  if not can_view_request(r.engineer_id, r.supervisor_id) then
+    raise exception 'You do not have permission to receive items on this request.';
+  end if;
+  for it in select id, quantity - received_quantity as left_qty from request_items
+            where request_id = p_request_id and not is_vat and received_quantity < quantity order by id loop
+    perform receive_items(it.id, it.left_qty);
+  end loop;
+end $$;
+
+-- Undo a submitted receipt (clinical engineer or administrator). Not allowed once it is covered by an MRR.
+create or replace function public.cancel_receipt(p_receipt_id bigint)
+returns void language plpgsql security definer set search_path = public as $$
+declare x request_receipts;
+begin
+  if not (is_admin() or is_clinical()) then raise exception 'Only a clinical engineer (or an admin) can cancel a receipt.'; end if;
+  select * into x from request_receipts where id = p_receipt_id for update;
+  if x.id is null then raise exception 'Receipt not found.'; end if;
+  if x.mrr_id is not null then raise exception 'This receipt is covered by an MRR. Remove the MRR first.'; end if;
+  update request_items set received_quantity = greatest(0, received_quantity - x.quantity), received_at = null
+   where id = x.request_item_id;
+  delete from request_receipts where id = x.id;
+  perform _sync_vat(x.request_id);
+  update requests set status = 'approved', archived = false where id = x.request_id and status = 'closed';
+end $$;
+
+-- Remove an MRR entered by mistake; its lines go back to "received, no MRR" and the request leaves the archive.
+create or replace function public.delete_mrr(p_mrr_id bigint)
+returns void language plpgsql security definer set search_path = public as $$
+declare rid bigint;
+begin
+  if not (is_admin() or is_clinical()) then raise exception 'Only a clinical engineer (or an admin) can remove an MRR.'; end if;
+  delete from mrrs where id = p_mrr_id returning request_id into rid;
+  if rid is null then raise exception 'MRR not found.'; end if;
+  update requests set archived = false where id = rid;
+end $$;
+
+-- Return a request for amendment. p_reason: general note. p_line_notes: [{"item_id": 12, "note": "..."}]. Both optional.
+drop function if exists public.return_request(bigint, text);
+create or replace function public.return_request(p_request_id bigint, p_reason text default null, p_line_notes jsonb default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare r requests; notes jsonb;
+begin
+  select * into r from requests where id = p_request_id for update;
+  if r.id is null then raise exception 'Request not found.'; end if;
+  if r.status = 'pending' then
+    if not (is_admin() or (r.supervisor_id = auth.uid() and is_active_user())) then
+      raise exception 'Only the request''s supervisor can return it at this stage.';
+    end if;
+  elsif r.status = 'pending_clinical' then
+    if not (is_admin() or is_clinical()) then
+      raise exception 'Only a clinical engineer can return the request at this stage.';
+    end if;
+  else
+    raise exception 'This request cannot be returned in its current status.';
+  end if;
+  -- keep a copy of each noted line, so the notes stay readable while the engineer edits the request
+  select jsonb_agg(jsonb_build_object('line_number', ri.line_number, 'part_number', ri.part_number,
+           'description', ri.description, 'htm_number', ri.htm_number, 'note', trim(n->>'note')) order by ri.line_number, ri.id)
+    into notes
+    from jsonb_array_elements(coalesce(p_line_notes, '[]'::jsonb)) n
+    join request_items ri on ri.id = (n->>'item_id')::bigint and ri.request_id = p_request_id
+   where coalesce(trim(n->>'note'), '') <> '';
+  update requests set status = 'returned', return_reason = nullif(trim(coalesce(p_reason, '')), ''),
+         return_notes = notes, returned_at = now() where id = p_request_id;
+  perform notify_user(r.engineer_id, 'request_returned',
+    format('Request %s was returned to you for amendment.%s', r.request_number,
+           case when coalesce(trim(p_reason), '') <> '' then ' Note: ' || trim(p_reason) else ' Open it to see the notes.' end), r.id);
+end $$;
+
+-- Issue the release. The promise date is set later, when the request is marked approved.
+create or replace function public.complete_request(p_request_id bigint, p_release_number text, p_promise_date text default null)
+returns void language plpgsql security definer set search_path = public as $$
+declare r requests;
+begin
+  select * into r from requests where id = p_request_id for update;
+  if r.id is null then raise exception 'Request not found.'; end if;
+  if not (is_admin() or is_clinical()) then
+    raise exception 'Only a clinical engineer (or an admin) can complete a request.';
+  end if;
+  if r.status <> 'pending_clinical' then raise exception 'This request is not awaiting procurement completion.'; end if;
+  if coalesce(trim(p_release_number), '') = '' then raise exception 'Release number is required to complete the request.'; end if;
+  update requests set status = 'in_process', release_number = trim(p_release_number),
+         promise_date = nullif(p_promise_date, '')::date, release_status = 'in_process' where id = p_request_id;
+  perform notify_user(u, 'request_completed',
+    format('Request %s is now in process. Release %s.', r.request_number, trim(p_release_number)), r.id)
+  from (select distinct unnest(array[r.engineer_id, r.supervisor_id]) as u) x;
+end $$;
+
+-- Mark approved. The promise date becomes 30 working days from today; it stays editable in release tracking.
+create or replace function public.approve_final(p_request_id bigint)
+returns void language plpgsql security definer set search_path = public as $$
+declare r requests; d date := add_working_days(current_date, 30);
+begin
+  select * into r from requests where id = p_request_id for update;
+  if r.id is null then raise exception 'Request not found.'; end if;
+  if not can_view_request(r.engineer_id, r.supervisor_id) then raise exception 'You do not have access to this request.'; end if;
+  if r.status <> 'in_process' then raise exception 'Only a request that is in process can be marked approved.'; end if;
+  update requests set status = 'approved', release_status = 'approved', promise_date = d where id = p_request_id;
+  perform notify_user(u, 'request_final_approved',
+    format('Request %s is approved. Promise date %s. The release email is ready.', r.request_number, to_char(d, 'DD Mon YYYY')), r.id)
+  from (select distinct unnest(array[r.engineer_id, r.supervisor_id]) as u) x;
+  perform _maybe_close(p_request_id);   -- parts may already be received
+end $$;
+
+-- Bring an archived request back to the working lists (clinical engineer or administrator).
+create or replace function public.unarchive_request(p_request_id bigint)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not (is_admin() or is_clinical()) then raise exception 'Only a clinical engineer (or an admin) can restore an archived request.'; end if;
+  update requests set archived = false where id = p_request_id;
+  if not found then raise exception 'Request not found.'; end if;
 end $$;
 
 -- Link received lines to an MRR number (clinical engineer or administrator).
@@ -849,17 +971,6 @@ begin
   return jsonb_build_object('mrr_id', m.id, 'mrr_number', m.mrr_number, 'lines', n);
 end $$;
 
--- Remove an MRR entered by mistake; its lines go back to "received, no MRR".
-create or replace function public.delete_mrr(p_mrr_id bigint)
-returns void language plpgsql security definer set search_path = public as $$
-declare rid bigint;
-begin
-  if not (is_admin() or is_clinical()) then raise exception 'Only a clinical engineer (or an admin) can remove an MRR.'; end if;
-  delete from mrrs where id = p_mrr_id returning request_id into rid;
-  if rid is null then raise exception 'MRR not found.'; end if;
-  -- its lines have no MRR again, so a closed request goes back to approved until they are covered
-  update requests set status = 'approved', archived = false where id = rid and status = 'closed';
-end $$;
 
 -- Rename a position or a specialty and carry the new name to every contact that uses it.
 create or replace function public.rename_contact_option(p_kind text, p_old text, p_new text)
@@ -876,21 +987,6 @@ begin
   else
     raise exception 'Unknown list.';
   end if;
-end $$;
-
-create or replace function public.receive_all(p_request_id bigint)
-returns void language plpgsql security definer set search_path = public as $$
-declare r requests; it record;
-begin
-  select * into r from requests where id = p_request_id;
-  if r.id is null then raise exception 'Request not found.'; end if;
-  if not can_view_request(r.engineer_id, r.supervisor_id) then
-    raise exception 'You do not have permission to receive items on this request.';
-  end if;
-  for it in select id, quantity - received_quantity as left_qty from request_items
-            where request_id = p_request_id and received_quantity < quantity loop
-    perform receive_items(it.id, it.left_qty);
-  end loop;
 end $$;
 
 create or replace function public.mark_received(p_item_id bigint)
@@ -915,16 +1011,6 @@ begin
   update requests set archived = true where id = p_request_id;
 end $$;
 
-create or replace function public.unarchive_request(p_request_id bigint)
-returns void language plpgsql security definer set search_path = public as $$
-declare r requests;
-begin
-  select * into r from requests where id = p_request_id;
-  if r.id is null then raise exception 'Request not found.'; end if;
-  if not can_view_request(r.engineer_id, r.supervisor_id) then raise exception 'You do not have permission.'; end if;
-  update requests set archived = false where id = p_request_id;
-end $$;
-
 -- ---------------------------------------------------------------------
 -- 8. Privileges: signed-in users only, nothing for anonymous visitors
 -- ---------------------------------------------------------------------
@@ -945,11 +1031,12 @@ begin
                'cancel_request','resubmit_request','return_request','decide_request','complete_request',
                'approve_final','update_tracking','receive_items','receive_all','mark_received',
                'archive_request','unarchive_request','create_mrr','delete_mrr','rename_contact_option',
+               'receive_lines','cancel_receipt','add_working_days','_sync_vat',
                -- internal helpers: never callable from the browser
                '_validate_items','_insert_items','_vat_for','_maybe_close','notify_user','notify_clinical_pool',
                'handle_new_user','audit_trigger') loop
     execute format('revoke all on function %s from public, anon, authenticated', f.sig);
-    if f.proname not in ('_validate_items','_insert_items','_vat_for','_maybe_close','notify_user',
+    if f.proname not in ('_validate_items','_insert_items','_vat_for','_maybe_close','_sync_vat','notify_user',
                          'notify_clinical_pool','handle_new_user','audit_trigger') then
       execute format('grant execute on function %s to authenticated', f.sig);
     end if;

@@ -10,7 +10,7 @@ export const STATUS_LABEL = {
   returned: 'Returned for amendment',
   rejected: 'Rejected',
   cancelled: 'Cancelled',
-  closed: 'Closed',
+  closed: 'Complete',
 }
 export const STATUS_STYLE = {
   pending:          'bg-amber-100 text-amber-700',
@@ -44,6 +44,13 @@ export function vatFor(taxableSubtotal, vatLineValue) {
   const qty = Math.round(r2(taxableSubtotal * VAT_RATE) / value * 10000) / 10000
   return { qty, amount: r2(qty * value) }
 }
+// VAT quantity counted as received once the taxed parts in `lines` ({ item, quantity }) are received.
+// vatLine: the request's VAT row. taxedDone: true when every taxed part is then fully received.
+export function vatQtyFor(lines, vatLine) {
+  if (!vatLine) return 0
+  const value = lines.filter(l => l.item?.taxable && !l.item?.is_vat).reduce((s, l) => s + l.item.unit_price * Number(l.quantity), 0)
+  return Math.min(Number(vatLine.quantity), vatFor(value, vatLine.unit_price).qty)
+}
 export const fmtQty = (n) => String(Number(Number(n ?? 0).toFixed(4)))
 export const partsTotal = (r) => (r.request_items || []).filter(i => !i.is_vat).reduce((s, i) => s + i.unit_price * i.quantity, 0)
 export const vatTotal = (r) => (r.request_items || []).filter(i => i.is_vat).reduce((s, i) => s + i.unit_price * i.quantity, 0)
@@ -55,7 +62,8 @@ export function groupByDevice(items = []) {
     if (!map.has(key)) map.set(key, { key, htm: it.htm_number, serial: it.serial_number, wo: it.work_order_number, lines: [] })
     map.get(key).lines.push(it)
   }
-  return [...map.values()]
+  // parts of a device in contract line order
+  return [...map.values()].map(d => ({ ...d, lines: [...d.lines].sort((a, b) => (a.line_number ?? 0) - (b.line_number ?? 0) || a.id - b.id) }))
 }
 // Parts on a request with the total across devices.
 export function groupByPart(items = []) {
@@ -66,7 +74,7 @@ export function groupByPart(items = []) {
     const g = map.get(key)
     g.quantity += Number(it.quantity); g.received_quantity += Number(it.received_quantity || 0); g.lines.push(it)
   }
-  return [...map.values()]
+  return [...map.values()].sort((a, b) => (a.line_number ?? 0) - (b.line_number ?? 0) || a.id - b.id)
 }
 export const requestTotal = (r) => (r.request_items || []).reduce((s, i) => s + i.unit_price * i.quantity, 0)
 export const isOverdue = (r) => ['in_process', 'approved'].includes(r.status) && r.promise_date
@@ -84,9 +92,10 @@ export function buildTimeline(r) {
   const supervisorMade = r.engineer?.id && r.supervisor?.id && r.engineer.id === r.supervisor.id
   const terminalReject = r.status === 'rejected'
   const cancelled = r.status === 'cancelled'
-  const order = ['submitted', 'supervisor', 'clinical', 'in_process', 'approved', 'receiving', 'closed']
+  const order = ['submitted', 'supervisor', 'clinical', 'in_process', 'approved', 'receiving', 'closed', 'archived']
+  // position of the stage the request is waiting at; every stage before it is done
   const idx = {
-    pending: 0, returned: 0, pending_clinical: 2, in_process: 3, approved: 4, closed: 6,
+    pending: 0, returned: 0, pending_clinical: 2, in_process: 3, approved: 5, closed: r.archived ? 8 : 7,
     rejected: 1, cancelled: 0,
   }[r.status] ?? 0
   const stages = [
@@ -96,7 +105,8 @@ export function buildTimeline(r) {
     { key: 'in_process', label: 'In process', at: null, desc: r.release_number ? `Release ${r.release_number}` : 'release issued' },
     { key: 'approved', label: 'Approved', at: null, desc: 'release approved' },
     { key: 'receiving', label: 'Receiving parts', at: null, desc: 'goods receipt' },
-    { key: 'closed', label: 'Closed', at: null, desc: 'received, MRR done' },
+    { key: 'closed', label: 'Complete', at: null, desc: 'fully received' },
+    { key: 'archived', label: 'Archived', at: null, desc: r.status === 'closed' && !r.archived ? 'waiting for MRR' : 'MRR recorded' },
   ]
   return stages.map(st => {
     const pos = order.indexOf(st.key)
@@ -104,9 +114,9 @@ export function buildTimeline(r) {
     if (terminalReject && st.key === 'supervisor') state = 'rejected'
     else if (cancelled && st.key === 'submitted') state = 'done'
     else if (pos < idx) state = 'done'
-    else if (pos === idx) state = (r.status === 'closed' ? 'done' : r.status === 'returned' ? 'returned' : 'current')
+    else if (pos === idx) state = r.status === 'returned' ? 'returned' : 'current'
     return { ...st, state }
-  }).filter(st => !(terminalReject && ['clinical', 'in_process', 'approved', 'receiving', 'closed'].includes(st.key)))
+  }).filter(st => !(terminalReject && ['clinical', 'in_process', 'approved', 'receiving', 'closed', 'archived'].includes(st.key)))
 }
 
 const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -122,7 +132,8 @@ export function releaseLines(items = []) {
     if (row) row.quantity += Number(it.quantity)
     else map.set(key, { ...it, quantity: Number(it.quantity) })
   }
-  return [...map.values()].sort((x, y) => (x.is_vat ? 1 : 0) - (y.is_vat ? 1 : 0))
+  // contract line order, VAT line last
+  return [...map.values()].sort((x, y) => (x.is_vat ? 1 : 0) - (y.is_vat ? 1 : 0) || (x.line_number ?? 0) - (y.line_number ?? 0))
 }
 
 export function buildApprovalEmail(req, settings = {}) {

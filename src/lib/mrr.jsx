@@ -2,7 +2,7 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import { supabase } from './supabase'
 import { Btn, Input, Modal, Alert, Field } from '../ui.jsx'
-import { fmtDate, fmtQty, downloadEml, escHtml } from './helpers'
+import { fmtDate, fmtQty, downloadEml, escHtml, vatQtyFor } from './helpers'
 
 const today = () => new Date().toISOString().slice(0, 10)
 const daysSince = (d) => Math.max(0, Math.floor((Date.now() - new Date(d).getTime()) / 86400000))
@@ -86,12 +86,17 @@ export function MrrModal({ request, onClose, onSaved }) {
   const [date, setDate] = useState(today())
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
+  // reset only when the dialog opens, so a re-render of the page behind it does not clear what was typed
+  const openFor = request ? request.id : null
   useEffect(() => {
-    if (!request) return
+    if (openFor == null) return
     setPicked(Object.fromEntries(lines.map(x => [x.id, true]))); setNumber(''); setDate(today()); setErr('')
-  }, [request, lines])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openFor])
   if (!request) return null
   const ids = lines.filter(x => picked[x.id]).map(x => x.id)
+  const vatLine = (request.request_items || []).find(i => i.is_vat)
+  const vatQty = vatQtyFor(lines.filter(x => picked[x.id]), vatLine)
   const save = async () => {
     setErr(''); setBusy(true)
     const { error } = await supabase.rpc('create_mrr', { p_request_id: request.id, p_mrr_number: number.trim(), p_mrr_date: date, p_receipt_ids: ids })
@@ -123,6 +128,13 @@ export function MrrModal({ request, onClose, onSaved }) {
           </li>
         ))}
       </ul>
+      {vatLine && (
+        <p className="text-[13px] text-ink-600 bg-gold-100/50 border border-gold-200 rounded-lg px-4 py-2.5 mb-5">
+          VAT line <span className="num">{vatLine.line_number}</span>: {vatQty > 0
+            ? <>quantity <span className="num font-medium">{fmtQty(vatQty)}</span> is covered by this MRR, for the taxed parts selected.</>
+            : 'none of the selected parts is taxed, so this MRR carries no VAT.'}
+        </p>
+      )}
       <div className="grid sm:grid-cols-2 gap-4">
         <Input label="MRR number" value={number} onChange={e => setNumber(e.target.value)} />
         <Input label="MRR date" type="date" value={date} onChange={e => setDate(e.target.value)} />

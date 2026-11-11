@@ -4,6 +4,7 @@ import { supabase, imgUrl } from '../lib/supabase'
 import { useApp } from '../App.jsx'
 import { Card, SectionHead, Btn, Input, Select, Modal, Empty, PageTitle, BackLink, Alert, Badge, SearchInput, Icon } from '../ui.jsx'
 import { money, statusLabel, vatFor, fmtQty } from '../lib/helpers'
+import { ReturnNotes } from './Requests.jsx'
 
 const CONTRACT_SELECT = '*, vendors(name)'
 let nextKey = 1
@@ -51,6 +52,7 @@ export default function NewRequest() {
   const [busy, setBusy] = useState(false)
   const [done, setDone] = useState(null)
   const [saved, setSaved] = useState(false)
+  const [returned, setReturned] = useState(null)    // notes from the reviewer when amending a returned request
 
   useEffect(() => {
     (async () => {
@@ -80,6 +82,7 @@ export default function NewRequest() {
       ])
       setContract(req.contracts); setBal(b); setItems(ci || [])
       setSupervisorId(req.supervisor_id)
+      if (req.status === 'returned') setReturned({ reason: req.return_reason, notes: req.return_notes })
       const byId = Object.fromEntries((ci || []).map(x => [x.id, x]))
       const groups = new Map()
       for (const it of [...(req.request_items || [])].sort((a, b) => a.id - b.id)) {
@@ -357,6 +360,7 @@ export default function NewRequest() {
           subtitle="Enter a device once, then pick its parts. Add another device if the request covers more than one.">Devices and parts</PageTitle>
         {!editId && stepper}
         {contractBar}
+        {returned && <ReturnNotes {...returned} />}
         {err && <Alert>{err}</Alert>}
         {deviceTabs}
 
@@ -442,6 +446,7 @@ export default function NewRequest() {
         subtitle="Check each device and its parts before you send the request.">{editId ? 'Edit request' : 'Review request'}</PageTitle>
       {!editId && stepper}
       {err && <Alert>{err}</Alert>}
+      {returned && <ReturnNotes {...returned} />}
       {contractBar}
       {noModel > 0 && <Alert kind="warn">{noModel} part{noModel === 1 ? ' has' : 's have'} no model or equipment description on the contract, so {noModel === 1 ? 'that column stays' : 'those columns stay'} empty in the release email. A supervisor can add them on the contract line.</Alert>}
       {vatMissing && <Alert>This request has parts with VAT, but contract {contract.contract_number} has no VAT line. A supervisor needs to set the VAT line on the contract before the request can be submitted.</Alert>}

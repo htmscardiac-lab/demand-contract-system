@@ -6,10 +6,10 @@ import { usePoll } from '../lib/poll.js'
 import { Card, Btn, Input, Select, Textarea, Badge, Modal, Drawer, Spinner, Empty, PageTitle, Alert, TableWrap, Th, Td, Row,
          Tabs, SearchInput, Field, Meter, Icon } from '../ui.jsx'
 import { MrrModal, MrrReminderModal, unlinkedReceipts } from '../lib/mrr.jsx'
-import { money, fmtDate, fmtDateTime, STATUS_STYLE, statusLabel, receiptLabel, actionFor, requestTotal, isOverdue, fmtQty, groupByDevice, groupByPart,
+import { money, fmtDate, fmtDateTime, STATUS_STYLE, statusLabel, receiptLabel, actionFor, requestTotal, isOverdue, fmtQty, groupByDevice, groupByPart, vatQtyFor,
          ACTIVE_STATUSES, DONE_STATUSES, buildTimeline, buildApprovalEmail, downloadOutlookEmail } from '../lib/helpers'
 
-export const REQUEST_QUERY = `*, request_items(*), request_receipts(*), mrrs(*),
+export const REQUEST_QUERY = `*, request_items(*), request_receipts(*, receiver:profiles!request_receipts_received_by_fkey(id, full_name)), mrrs(*),
   contracts(id, contract_number, po_number, vendors(name, vendor_contacts(name, email, phone))),
   engineer:profiles!requests_engineer_id_fkey(id, full_name),
   supervisor:profiles!requests_supervisor_id_fkey(id, full_name)`
@@ -20,6 +20,7 @@ export default function Requests() {
   const { profile } = useApp()
   const navigate = useNavigate()
   const [reqs, setReqs] = useState(null)
+  const [loadErr, setLoadErr] = useState('')
   const [sel, setSel] = useState(null)
   const [q, setQ] = useState('')
   const [status, setStatus] = useState('')
@@ -27,7 +28,10 @@ export default function Requests() {
   const [view, setView] = useState(VIEWS.includes(params.get('view')) ? params.get('view') : null)
 
   const load = useCallback(async () => {
-    const { data } = await supabase.from('requests').select(REQUEST_QUERY).order('submitted_at', { ascending: false })
+    const { data, error } = await supabase.from('requests').select(REQUEST_QUERY).order('submitted_at', { ascending: false })
+    // a failed query must not look like an empty list
+    if (error) { setLoadErr(`Could not load requests: ${error.message}. If this mentions request_receipts or mrrs, run supabase/migration_004_contacts_mrr.sql in the Supabase SQL Editor.`); return reqs || [] }
+    setLoadErr('')
     setReqs(data || [])
     return data || []
   }, [])
@@ -43,6 +47,7 @@ export default function Requests() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [openId, reqs])
 
+  if (loadErr && !reqs) return <Alert>{loadErr}</Alert>
   if (!reqs) return <Spinner />
   const live = reqs.filter(r => !r.archived)
   const groups = {
@@ -174,6 +179,23 @@ function Timeline({ request }) {
   )
 }
 
+// Notes left when a request was returned: one per line, plus a general note.
+export function ReturnNotes({ reason, notes }) {
+  const list = Array.isArray(notes) ? notes : []
+  return (
+    <Alert kind="warn">
+      <b className="font-medium">Returned for amendment.</b>{reason ? ` ${reason}` : list.length ? '' : ' No note was left.'}
+      {list.length > 0 && (
+        <ul className="mt-2 space-y-1.5">
+          {list.map((n, i) => (
+            <li key={i}><span className="font-medium">Line <span className="num">{n.line_number}</span> · {n.description}</span>{n.htm_number && <span className="num"> (HTM {n.htm_number})</span>}: {n.note}</li>
+          ))}
+        </ul>
+      )}
+    </Alert>
+  )
+}
+
 export function RequestDetail({ request: r, onClose, decideMode = false }) {
   const { profile, settings } = useApp()
   const navigate = useNavigate()
@@ -181,7 +203,11 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
     release_number: r.release_number || '', release_status: r.release_status || 'in_process',
     promise_date: r.promise_date || '', last_followup_date: r.last_followup_date || '',
   })
-  const [complete, setComplete] = useState({ release_number: r.release_number || '', promise_date: r.promise_date || '' })
+  const [complete, setComplete] = useState({ release_number: r.release_number || '' })
+  const [archived, setArchived] = useState(!!r.archived)
+  const [lineNotes, setLineNotes] = useState({})          // return notes, by request line id
+  const [recv, setRecv] = useState({})                    // receipt being prepared: line id -> quantity
+  const [cancelRc, setCancelRc] = useState(null)          // receipt the clinical engineer is about to cancel
   const [items, setItems] = useState(r.request_items)
   const [receipts, setReceipts] = useState(r.request_receipts || [])
   const [mrrs, setMrrs] = useState(r.mrrs || [])
@@ -191,37 +217,29 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
   const [reason, setReason] = useState('')
   const [modal, setModal] = useState(null)
   const [by, setBy] = useState('device')   // how the parts are grouped: by device or by part
-  const [recvItem, setRecvItem] = useState(null)
-  const [recvQty, setRecvQty] = useState(1)
   const [err, setErr] = useState('')
   const [ok, setOk] = useState('')
   const [busy, setBusy] = useState(false)
 
-  const view = { ...r, request_items: items, request_receipts: receipts, mrrs, status }
+  const view = { ...r, request_items: items, request_receipts: receipts, mrrs, status, archived }
   const noMrr = unlinkedReceipts(view)
   const canMrr = profile.role === 'clinical_engineer' || profile.role === 'admin'
   const total = items.reduce((s, i) => s + i.unit_price * i.quantity, 0)
-  const parts = items.filter(i => !i.is_vat)
+  const parts = items.filter(i => !i.is_vat).sort((a, b) => (a.line_number ?? 0) - (b.line_number ?? 0) || a.id - b.id)
   const vatLine = items.find(i => i.is_vat)
   const partsSum = parts.reduce((s, i) => s + i.unit_price * i.quantity, 0)
   const deviceGroups = groupByDevice(items)
   const partGroups = groupByPart(items)
   const partOf = (it) => partGroups.find(g => g.lines.some(l => l.id === it.id))
-  // receipt status and buttons of one request line
+  // receipt status of one request line
   const receipt = (it) => {
     if (!canTrack) return null
     const outstanding = it.quantity - (it.received_quantity || 0)
     return (
-      <div className="flex flex-wrap items-center justify-between gap-2 mt-3">
+      <div className="mt-3">
         {outstanding === 0
           ? <Badge className="bg-olive-100 text-olive-700"><Icon name="check" className="w-3 h-3" strokeWidth={2.6} />Received</Badge>
           : <Badge className={it.received_quantity > 0 ? 'bg-amber-100 text-amber-700' : 'bg-ink-100 text-ink-600'}>{receiptLabel(it)}</Badge>}
-        {outstanding > 0 && (
-          <div className="flex gap-2">
-            <Btn size="sm" variant="secondary" disabled={busy} onClick={() => { setRecvItem(it); setRecvQty(outstanding); setModal('receive') }}>Receive some</Btn>
-            <Btn size="sm" variant="success" disabled={busy} onClick={() => call('receive_items', { p_item_id: it.id, p_quantity: outstanding }, 'Line received in full.', refresh)}>Receive all {fmtQty(outstanding)}</Btn>
-          </div>
-        )}
       </div>
     )
   }
@@ -236,19 +254,35 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
   const canFinalApprove = status === 'in_process'
   const canTrack = ['in_process', 'approved', 'closed'].includes(status)
   const showEmail = ['approved', 'closed'].includes(status)
+  // receiving: choose lines and quantities first, nothing is saved until the receipt is submitted
+  const canReceive = ['in_process', 'approved'].includes(status)
+  const openLines = parts.filter(i => i.quantity > (i.received_quantity || 0))
+  const picked = openLines.filter(i => recv[i.id] > 0).map(i => ({ item: i, quantity: recv[i.id] }))
+  const byItem = Object.fromEntries(items.map(i => [i.id, i]))
+  const vatGain = (() => {
+    if (!vatLine || !picked.some(l => l.item.taxable)) return 0
+    const after = parts.filter(i => i.taxable).map(i => ({ item: i, quantity: Number(i.received_quantity || 0) + (recv[i.id] > 0 ? recv[i.id] : 0) }))
+    const done = after.every(l => l.quantity >= l.item.quantity)
+    return Math.max(0, (done ? Number(vatLine.quantity) : vatQtyFor(after, vatLine)) - Number(vatLine.received_quantity || 0))
+  })()
+  const submitReceipt = () => call('receive_lines', { p_request_id: r.id, p_lines: picked.map(l => ({ item_id: l.item.id, quantity: l.quantity })) },
+    `Receipt submitted for ${picked.length} line${picked.length === 1 ? '' : 's'}.`, () => { setRecv({}); refresh() })
   const email = buildApprovalEmail(view, settings)
 
   const refresh = async () => {
     const { data } = await supabase.from('request_items').select('*').eq('request_id', r.id).order('id')
     if (data) setItems(data)
     const [{ data: rc }, { data: mr }] = await Promise.all([
-      supabase.from('request_receipts').select('*').eq('request_id', r.id).order('id'),
+      supabase.from('request_receipts').select('*, receiver:profiles!request_receipts_received_by_fkey(id, full_name)').eq('request_id', r.id).order('id'),
       supabase.from('mrrs').select('*').eq('request_id', r.id).order('id'),
     ])
     if (rc) setReceipts(rc)
     if (mr) setMrrs(mr)
-    const { data: rq } = await supabase.from('requests').select('status, release_number, promise_date').eq('id', r.id).single()
-    if (rq) { setStatus(rq.status); r.release_number = rq.release_number; r.promise_date = rq.promise_date }
+    const { data: rq } = await supabase.from('requests').select('status, archived, release_number, promise_date').eq('id', r.id).single()
+    if (rq) {
+      setStatus(rq.status); setArchived(!!rq.archived); r.release_number = rq.release_number; r.promise_date = rq.promise_date; r.archived = rq.archived
+      setTrack(t => ({ ...t, release_number: rq.release_number || '', promise_date: rq.promise_date || '', release_status: rq.status === 'in_process' ? 'in_process' : 'approved' }))
+    }
   }
 
   const call = async (fn, args, okMsg, after) => {
@@ -272,14 +306,6 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
     if (!error) { setSavedFlash(true); setTimeout(() => setSavedFlash(false), 1500) }
   }
 
-  const doReceive = async () => {
-    setErr(''); setBusy(true)
-    const { error } = await supabase.rpc('receive_items', { p_item_id: recvItem.id, p_quantity: Number(recvQty) })
-    setBusy(false)
-    if (error) return setErr(error.message)
-    setModal(null); setOk('Receipt recorded.'); refresh()
-  }
-
   const footer = (canEdit || canResubmit || canDecide || canComplete || canFinalApprove || showEmail) && (<>
     {canEdit && <Btn variant="danger" className="mr-auto" onClick={() => setModal('cancel')}>Cancel request</Btn>}
     {canEdit && <Btn variant="secondary" icon="edit" onClick={() => { onClose(); navigate(`/new-request?edit=${r.id}`) }}>Edit</Btn>}
@@ -294,17 +320,17 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
       <Btn onClick={() => setModal('complete')} disabled={busy}>Issue release</Btn>
     </>}
     {showEmail && <Btn variant="secondary" icon="mail" onClick={() => setModal('email')}>Release email</Btn>}
-    {canFinalApprove && <Btn variant="success" icon="check" disabled={busy} onClick={() => call('approve_final', { p_request_id: r.id }, 'Request marked approved.', refresh)}>Mark approved</Btn>}
+    {canFinalApprove && <Btn variant="success" icon="check" disabled={busy} onClick={() => call('approve_final', { p_request_id: r.id }, 'Request marked approved. Promise date set to 30 working days from today.', refresh)}>Mark approved</Btn>}
   </>)
 
   return (
     <Drawer open onClose={onClose} title={r.request_number}
       subtitle={`Submitted ${fmtDateTime(r.submitted_at)}`}
-      badge={<Badge className={STATUS_STYLE[status]}>{statusLabel(status)}</Badge>} footer={footer}>
+      badge={<><Badge className={STATUS_STYLE[status]}>{statusLabel(status)}</Badge>{archived && <Badge className="bg-ink-100 text-ink-600"><Icon name="archive" className="w-3 h-3" />Archived</Badge>}</>} footer={footer}>
       {err && <Alert>{err}</Alert>}
       {ok && <Alert kind="ok">{ok}</Alert>}
       {status === 'rejected' && r.rejection_reason && <Alert><b className="font-medium">Rejected.</b> {r.rejection_reason}</Alert>}
-      {status === 'returned' && r.return_reason && <Alert kind="warn"><b className="font-medium">Returned for amendment.</b> {r.return_reason}</Alert>}
+      {status === 'returned' && <ReturnNotes reason={r.return_reason} notes={r.return_notes} />}
 
       <Card className="p-5">
         <dl className="grid grid-cols-2 sm:grid-cols-3 gap-x-6 gap-y-4">
@@ -335,8 +361,8 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
                 className={`h-8 px-3 transition-colors ${by === k ? 'bg-ink-900 text-white' : 'bg-white text-ink-700 hover:bg-ink-50'}`}>{label}</button>
             ))}
           </div>
-          {canTrack && items.some(i => i.quantity > (i.received_quantity || 0)) && (
-            <Btn size="sm" variant="secondary" icon="box" disabled={busy} onClick={() => call('receive_all', { p_request_id: r.id }, 'All outstanding parts received.', refresh)}>Receive all outstanding</Btn>
+          {canReceive && openLines.length > 0 && (
+            <Btn size="sm" icon="box" disabled={busy} onClick={() => { setRecv({}); setErr(''); setModal('receive') }}>Record receipt</Btn>
           )}
         </div>
         <ul>
@@ -405,31 +431,66 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
               </ul>
             </li>
           ))}
-          {vatLine && (
-            <li className="px-5 py-4 bg-gold-100/40 border-t border-gold-200">
-              <div className="flex items-start justify-between gap-4">
-                <div className="min-w-0">
-                  <div className="text-sm font-medium text-ink-900">VAT line</div>
-                  <div className="text-[12px] text-ink-600 mt-0.5">
-                    Line <span className="num">{vatLine.line_number}</span> · 15% of the taxed parts · quantity <span className="num">{fmtQty(vatLine.quantity)}</span> × <span className="num">{money(vatLine.unit_price)}</span>
+          {vatLine && (() => {
+            const got = Number(vatLine.received_quantity || 0), all = Number(vatLine.quantity)
+            return (
+              <li className="px-5 py-4 bg-gold-100/40 border-t border-gold-200">
+                <div className="flex items-start justify-between gap-4">
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium text-ink-900">VAT line</div>
+                    <div className="text-[12px] text-ink-600 mt-0.5">
+                      Line <span className="num">{vatLine.line_number}</span> · 15% of the taxed parts · quantity <span className="num">{fmtQty(all)}</span> × <span className="num">{money(vatLine.unit_price)}</span>
+                    </div>
                   </div>
+                  <div className="num text-sm font-medium text-ink-900 shrink-0">{money(vatLine.unit_price * all)}</div>
                 </div>
-                <div className="num text-sm font-medium text-ink-900 shrink-0">{money(vatLine.unit_price * vatLine.quantity)}</div>
-              </div>
-              {canTrack && (
-                <div className="flex flex-wrap items-center justify-between gap-2 mt-3">
-                  {vatLine.received_quantity >= vatLine.quantity
-                    ? <Badge className="bg-olive-100 text-olive-700"><Icon name="check" className="w-3 h-3" strokeWidth={2.6} />Received</Badge>
-                    : <>
-                        <Badge className="bg-ink-100 text-ink-600">Not received</Badge>
-                        <Btn size="sm" variant="success" disabled={busy} onClick={() => call('receive_items', { p_item_id: vatLine.id, p_quantity: vatLine.quantity - (vatLine.received_quantity || 0) }, 'VAT line received.', refresh)}>Receive VAT line</Btn>
-                      </>}
-                </div>
-              )}
-            </li>
-          )}
+                {canTrack && (<>
+                  <dl className="grid grid-cols-3 gap-3 mt-3">
+                    {[['Total', all], ['Received', got], ['Remaining', Math.max(0, all - got)]].map(([l, q]) => (
+                      <div key={l} className="rounded-lg bg-white/70 border border-gold-200 px-3 py-2">
+                        <dt className="text-[11px] font-medium uppercase tracking-[0.08em] text-ink-500">{l}</dt>
+                        <dd className="num text-sm font-medium text-ink-900 mt-0.5">{fmtQty(q)}</dd>
+                        <dd className="num text-[12px] text-ink-500">{money(q * vatLine.unit_price)}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                  <Meter pct={all ? got / all * 100 : 0} className="mt-3" />
+                  <p className="text-[12px] text-ink-600 mt-2">Received automatically with the taxed parts: only the VAT of the parts received so far is counted.</p>
+                </>)}
+              </li>
+            )
+          })()}
         </ul>
       </Card>
+
+      {canTrack && receipts.length > 0 && (
+        <Card className="overflow-hidden">
+          <div className="px-5 py-3.5 border-b border-ink-100">
+            <h4 className="font-display font-semibold text-[13px] tracking-[0.08em] uppercase text-ink-500">Receipt log · {receipts.length}</h4>
+          </div>
+          <ul>
+            {[...receipts].sort((a, b) => b.id - a.id).map(x => {
+              const it = byItem[x.request_item_id]; const m = mrrs.find(y => y.id === x.mrr_id)
+              const other = x.received_by && x.received_by !== r.engineer?.id
+              return it && (
+                <li key={x.id} className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-5 py-3 border-b border-ink-100 last:border-0">
+                  <div className="min-w-0 flex-1 basis-56">
+                    <div className="text-sm text-ink-900"><span className="num font-medium">{fmtQty(x.quantity)}</span> × {it.description} <span className="num text-[12px] text-ink-500">· Line {it.line_number} · HTM {it.htm_number}</span></div>
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] text-ink-500 mt-0.5">
+                      <span>{fmtDateTime(x.received_at)} · received by {x.receiver?.full_name || 'unknown'}</span>
+                      {other && <Badge className="bg-amber-100 text-amber-700">Not the requester</Badge>}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-3 shrink-0">
+                    {m ? <Badge className="bg-olive-100 text-olive-700 num">{m.mrr_number}</Badge> : <Badge className="bg-ink-100 text-ink-600">No MRR</Badge>}
+                    {canMrr && !m && <button onClick={() => setCancelRc(x)} disabled={busy} className="text-[13px] font-medium text-ink-500 hover:text-brand-700 hover:underline">Cancel receipt</button>}
+                  </div>
+                </li>
+              )
+            })}
+          </ul>
+        </Card>
+      )}
 
       {canTrack && receipts.length > 0 && (
         <Card className="overflow-hidden">
@@ -438,7 +499,7 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
               <h4 className="font-display font-semibold text-[13px] tracking-[0.08em] uppercase text-ink-500">MRR</h4>
               <p className={`text-[13px] mt-0.5 ${noMrr.length ? 'text-brand-700 font-medium' : 'text-ink-500'}`}>
                 {noMrr.length ? `${noMrr.length} received line${noMrr.length === 1 ? '' : 's'} without an MRR` : 'Every received line has an MRR'}
-                {status !== 'closed' && <span className="block font-normal text-ink-500">The request closes when every line is received and covered by an MRR.</span>}
+                {!archived && <span className="block font-normal text-ink-500">The request is archived once every part is received and covered by an MRR.</span>}
               </p>
             </div>
             {canMrr && noMrr.length > 0 && (
@@ -452,7 +513,8 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
             <ul>
               {mrrs.map(m => {
                 const mine = receipts.filter(x => x.mrr_id === m.id)
-                const byId = Object.fromEntries(items.map(i => [i.id, i]))
+                const byId = byItem
+                const mVat = vatQtyFor(mine.map(x => ({ item: byId[x.request_item_id], quantity: x.quantity })), vatLine)
                 return (
                   <li key={m.id} className="px-5 py-3.5 border-b border-ink-100 last:border-0">
                     <div className="flex flex-wrap items-center justify-between gap-3">
@@ -467,6 +529,12 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
                           <span className="num shrink-0">{fmtQty(x.quantity)}</span>
                         </li>
                       ) })}
+                      {vatLine && mVat > 0 && (
+                        <li className="flex justify-between gap-4 text-gold-700">
+                          <span className="truncate">VAT line <span className="num">· Line {vatLine.line_number}</span></span>
+                          <span className="num shrink-0">{fmtQty(mVat)}</span>
+                        </li>
+                      )}
                     </ul>
                   </li>
                 )
@@ -491,11 +559,9 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
             <Input label="Promise date" type="date" value={track.promise_date} onChange={e => { const v = e.target.value; setTrack(t => ({ ...t, promise_date: v })); autoSaveTracking({ ...track, promise_date: v }) }} />
             <Input label="Last follow-up with vendor" type="date" value={track.last_followup_date} onChange={e => { const v = e.target.value; setTrack(t => ({ ...t, last_followup_date: v })); autoSaveTracking({ ...track, last_followup_date: v }) }} />
           </div>
-          {status === 'closed' && (
+          {archived && canMrr && (
             <div className="flex justify-end mt-4">
-              {r.archived
-                ? <Btn variant="secondary" icon="archive" disabled={busy} onClick={() => call('unarchive_request', { p_request_id: r.id }, 'Request restored from the archive.', () => { r.archived = false; refresh() })}>Restore from archive</Btn>
-                : <Btn variant="dark" icon="archive" disabled={busy} onClick={() => call('archive_request', { p_request_id: r.id }, 'Request archived.', () => { r.archived = true; if (onClose) onClose() })}>Archive</Btn>}
+              <Btn variant="secondary" icon="archive" disabled={busy} onClick={() => call('unarchive_request', { p_request_id: r.id }, 'Request restored from the archive.', refresh)}>Restore from archive</Btn>
             </div>
           )}
         </Card>
@@ -513,11 +579,29 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
         </div>
       </Modal>
 
-      <Modal open={modal === 'return'} onClose={() => setModal(null)} title="Return to engineer">
-        <Textarea label="What needs to change" rows={3} value={reason} onChange={e => setReason(e.target.value)} placeholder="The engineer amends the request and resubmits it." />
+      <Modal open={modal === 'return'} onClose={() => setModal(null)} title="Return to engineer" wide>
+        <p className="text-sm text-ink-600 mb-4">Write a note under any line that needs to change, and a general note for the whole request. All notes are optional.</p>
+        <ul className="rounded-lg border border-ink-200 divide-y divide-ink-100 max-h-[44vh] overflow-y-auto mb-5">
+          {parts.map(it => (
+            <li key={it.id} className="px-4 py-3">
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0">
+                  <div className="text-sm font-medium text-ink-900">{it.description}</div>
+                  <div className="num text-[12px] text-ink-500 mt-0.5">Line {it.line_number} · {it.part_number} · HTM {it.htm_number} · SN {it.serial_number} · W.O {it.work_order_number}</div>
+                </div>
+                <div className="text-[13px] text-ink-700 shrink-0">Quantity <span className="num font-medium">{fmtQty(it.quantity)}</span></div>
+              </div>
+              <textarea rows={1} value={lineNotes[it.id] || ''} onChange={e => setLineNotes(n => ({ ...n, [it.id]: e.target.value }))}
+                aria-label={`Note for line ${it.line_number}`} placeholder="Note for this line"
+                className="mt-2 w-full rounded-lg border border-ink-300 bg-white px-3 py-2 text-sm text-ink-900 placeholder:text-ink-400 focus:outline-none focus:border-brand-600 focus:ring-3 focus:ring-brand-100" />
+            </li>
+          ))}
+        </ul>
+        <Textarea label="General note for the whole request" rows={3} value={reason} onChange={e => setReason(e.target.value)} />
         <div className="flex justify-end gap-2 mt-5">
           <Btn variant="secondary" onClick={() => setModal(null)}>Keep request</Btn>
-          <Btn disabled={!reason.trim() || busy} onClick={() => call('return_request', { p_request_id: r.id, p_reason: reason }, 'Request returned.', onClose)}>Return request</Btn>
+          <Btn disabled={busy} onClick={() => call('return_request', { p_request_id: r.id, p_reason: reason.trim() || null,
+            p_line_notes: Object.entries(lineNotes).filter(([, v]) => v.trim()).map(([id, note]) => ({ item_id: Number(id), note: note.trim() })) }, 'Request returned.', onClose)}>Return request</Btn>
         </div>
       </Modal>
 
@@ -530,36 +614,71 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
       </Modal>
 
       <Modal open={modal === 'complete'} onClose={() => setModal(null)} title="Issue release">
-        <p className="text-sm text-ink-600 mb-4">Enter the release number and the vendor's promise date. The request then moves to In process.</p>
-        <div className="grid sm:grid-cols-2 gap-4">
-          <Input label="Release number" value={complete.release_number} onChange={e => setComplete(c => ({ ...c, release_number: e.target.value }))} placeholder="REL-2026-045" />
-          <Input label="Promise date" type="date" value={complete.promise_date} onChange={e => setComplete(c => ({ ...c, promise_date: e.target.value }))} />
-        </div>
+        <p className="text-sm text-ink-600 mb-4">Enter the release number. The request then moves to In process. The promise date is set to 30 working days from the day the request is marked approved, and can be changed after that.</p>
+        <Input label="Release number" value={complete.release_number} onChange={e => setComplete({ release_number: e.target.value })} placeholder="045" />
         <div className="flex justify-end gap-2 mt-5">
           <Btn variant="secondary" onClick={() => setModal(null)}>Cancel</Btn>
-          <Btn disabled={busy || !complete.release_number.trim() || !complete.promise_date}
-            onClick={() => call('complete_request', { p_request_id: r.id, p_release_number: complete.release_number.trim(), p_promise_date: complete.promise_date }, 'Release issued. The request is in process.', refresh)}>
+          <Btn disabled={busy || !complete.release_number.trim()}
+            onClick={() => call('complete_request', { p_request_id: r.id, p_release_number: complete.release_number.trim(), p_promise_date: null }, 'Release issued. The request is in process.', refresh)}>
             Issue release
           </Btn>
         </div>
       </Modal>
 
-      <Modal open={modal === 'receive'} onClose={() => setModal(null)} title="Receive part">
-        {recvItem && (<>
-          <div className="text-sm font-medium text-ink-900">{recvItem.description}</div>
-          <div className="num text-[12px] text-ink-500 mt-0.5 mb-4">{recvItem.part_number} · HTM {recvItem.htm_number} · SN {recvItem.serial_number}</div>
-          <dl className="grid grid-cols-3 gap-3 mb-4">
-            {[['Requested', recvItem.quantity], ['Received so far', recvItem.received_quantity || 0],
-              ['Left after this', recvItem.quantity - (recvItem.received_quantity || 0) - (Number(recvQty) || 0)]].map(([l, v]) => (
-              <div key={l} className="rounded-lg bg-ink-50 px-3 py-2.5"><dd className="num text-lg font-medium text-ink-900">{v}</dd><dt className="text-[12px] text-ink-500">{l}</dt></div>
-            ))}
-          </dl>
-          <Input label="Quantity received now" type="number" min="1" max={recvItem.quantity - (recvItem.received_quantity || 0)} value={recvQty} onChange={e => setRecvQty(e.target.value)} />
-          <div className="flex justify-end gap-2 mt-5">
-            <Btn variant="secondary" onClick={() => setModal(null)}>Cancel</Btn>
-            <Btn variant="success" disabled={busy || !recvQty || Number(recvQty) < 1} onClick={doReceive}>Record receipt</Btn>
+      <Modal open={modal === 'receive'} onClose={() => setModal(null)} title="Record receipt" wide>
+        {err && <Alert>{err}</Alert>}
+        <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+          <p className="text-sm text-ink-600">Tick what arrived and set the quantity. Nothing is saved until you submit.</p>
+          <div className="flex gap-3 text-[13px] font-medium">
+            <button onClick={() => setRecv(Object.fromEntries(openLines.map(i => [i.id, i.quantity - (i.received_quantity || 0)])))} className="text-brand-700 hover:underline">Select all</button>
+            <button onClick={() => setRecv({})} className="text-ink-500 hover:underline">Clear</button>
           </div>
-        </>)}
+        </div>
+        <ul className="rounded-lg border border-ink-200 divide-y divide-ink-100 max-h-[46vh] overflow-y-auto">
+          {openLines.map(it => {
+            const left = it.quantity - (it.received_quantity || 0); const on = recv[it.id] > 0
+            return (
+              <li key={it.id} className={`flex flex-wrap items-center gap-x-4 gap-y-2 px-4 py-3 ${on ? 'bg-olive-50' : ''}`}>
+                <label className="flex items-center gap-3 min-w-0 flex-1 basis-64 cursor-pointer">
+                  <input type="checkbox" checked={on} onChange={e => setRecv(v => ({ ...v, [it.id]: e.target.checked ? left : 0 }))} className="w-4 h-4 accent-brand-600" />
+                  <span className="min-w-0">
+                    <span className="block text-sm font-medium text-ink-900">{it.description}{!!it.taxable && <Badge className="bg-gold-100 text-gold-700 ml-2">VAT</Badge>}</span>
+                    <span className="block num text-[12px] text-ink-500 mt-0.5">Line {it.line_number} · {it.part_number} · HTM {it.htm_number}</span>
+                  </span>
+                </label>
+                <div className="flex items-center gap-2 text-[13px] text-ink-600">
+                  <input type="number" min="0" max={left} step="1" value={recv[it.id] ?? 0} aria-label={`Quantity received for line ${it.line_number}`}
+                    onChange={e => setRecv(v => ({ ...v, [it.id]: Math.max(0, Math.min(left, Math.floor(Number(e.target.value)) || 0)) }))} onFocus={e => e.target.select()}
+                    className="num w-20 h-9 rounded-lg border border-ink-300 bg-white px-2 text-center text-sm text-ink-900 focus:outline-none focus:border-brand-600 focus:ring-3 focus:ring-brand-100" />
+                  <span>of <span className="num">{fmtQty(left)}</span> outstanding</span>
+                </div>
+              </li>
+            )
+          })}
+        </ul>
+        {vatLine && (
+          <p className="text-[13px] text-ink-600 bg-gold-100/50 border border-gold-200 rounded-lg px-4 py-2.5 mt-4">
+            VAT line <span className="num">{vatLine.line_number}</span>: {vatGain > 0
+              ? <>quantity <span className="num font-medium">{fmtQty(vatGain)}</span> is counted as received with the taxed parts selected.</>
+              : 'no VAT is counted, because no taxed part is selected.'}
+          </p>
+        )}
+        <div className="flex justify-end gap-2 mt-5">
+          <Btn variant="secondary" onClick={() => setModal(null)}>Cancel</Btn>
+          <Btn variant="success" icon="check" disabled={busy || picked.length === 0} onClick={submitReceipt}>
+            {busy ? 'Submitting…' : `Submit receipt · ${picked.length} line${picked.length === 1 ? '' : 's'}`}
+          </Btn>
+        </div>
+      </Modal>
+
+      <Modal open={!!cancelRc} onClose={() => setCancelRc(null)} title="Cancel receipt">
+        {cancelRc && byItem[cancelRc.request_item_id] && (
+          <p className="text-sm text-ink-600">The receipt of <span className="num font-medium">{fmtQty(cancelRc.quantity)}</span> × {byItem[cancelRc.request_item_id].description} (line <span className="num">{byItem[cancelRc.request_item_id].line_number}</span>) will be cancelled and the quantity goes back to outstanding.</p>
+        )}
+        <div className="flex justify-end gap-2 mt-5">
+          <Btn variant="secondary" onClick={() => setCancelRc(null)}>Keep receipt</Btn>
+          <Btn disabled={busy} onClick={() => { const id = cancelRc.id; setCancelRc(null); call('cancel_receipt', { p_receipt_id: id }, 'Receipt cancelled.', refresh) }}>Cancel receipt</Btn>
+        </div>
       </Modal>
 
       <Modal open={modal === 'email'} onClose={() => setModal(null)} title="Release email" wide>

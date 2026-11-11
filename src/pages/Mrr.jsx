@@ -14,6 +14,7 @@ export default function Mrr() {
   const { settings } = useApp()
   const navigate = useNavigate()
   const [reqs, setReqs] = useState(null)
+  const [loadErr, setLoadErr] = useState('')
   const [tab, setTab] = useState('pending')
   const [q, setQ] = useState('')
   const [vendor, setVendor] = useState('')
@@ -24,11 +25,14 @@ export default function Mrr() {
   const [busy, setBusy] = useState('')
 
   const load = useCallback(async () => {
-    const { data } = await supabase.from('requests').select(REQUEST_QUERY).in('status', ['in_process', 'approved', 'closed']).order('submitted_at', { ascending: false })
+    const { data, error } = await supabase.from('requests').select(REQUEST_QUERY).in('status', ['in_process', 'approved', 'closed']).order('submitted_at', { ascending: false })
+    if (error) { setLoadErr(`Could not load requests: ${error.message}. If this mentions request_receipts or mrrs, run supabase/migration_004_contacts_mrr.sql in the Supabase SQL Editor.`); return }
+    setLoadErr('')
     setReqs(data || [])
   }, [])
   usePoll(load, 15000, [load])
 
+  if (loadErr && !reqs) return <Alert>{loadErr}</Alert>
   if (!reqs) return <Spinner />
   const pendingAll = reqs.map(r => ({ r, lines: unlinkedReceipts(r) })).filter(x => x.lines.length > 0)
   const vendors = [...new Set(pendingAll.map(x => x.r.contracts?.vendors?.name).filter(Boolean))].sort()
