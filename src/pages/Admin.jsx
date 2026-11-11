@@ -142,9 +142,9 @@ export default function Admin() {
         {tab === 'settings' && (
           <div className="p-5 max-w-2xl">
             <h3 className="font-display font-semibold text-[15px] tracking-wide uppercase text-ink-900">Release email</h3>
-            <p className="text-[13px] text-ink-500 mt-1 mb-5">The release email is addressed to this mailbox and signed with the department name.</p>
+            <p className="text-[13px] text-ink-500 mt-1 mb-5">The release email goes to the vendor's contacts, with this mailbox in CC, and is signed with the department name.</p>
             <div className="grid gap-4">
-              <Input label="Recipient mailbox" type="email"
+              <Input label="Department mailbox (CC)" type="email"
                 value={dept.department_email} onChange={e => setDept(d => ({ ...d, department_email: e.target.value }))}
                 placeholder="htms@mngha.med.sa" />
               <Input label="Department name"

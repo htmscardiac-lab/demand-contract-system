@@ -35,6 +35,16 @@ create table if not exists public.vendors (
   created_at    timestamptz not null default now()
 );
 
+-- People to contact at a vendor (the vendor directory). The release email goes to their addresses.
+create table if not exists public.vendor_contacts (
+  id          bigint generated always as identity primary key,
+  vendor_id   bigint not null references public.vendors(id) on delete cascade,
+  name        text not null check (trim(name) <> ''),
+  email       text,
+  phone       text,
+  created_at  timestamptz not null default now()
+);
+
 create table if not exists public.contracts (
   id                        bigint generated always as identity primary key,
   contract_number           text unique not null,
@@ -59,6 +69,7 @@ create table if not exists public.contract_items (
   part_number  text not null,
   unit_price   numeric(14,2) not null check (unit_price >= 0),
   device_model text,
+  equipment_description text,
   taxable      boolean not null default false,
   image_path   text,
   unique (contract_id, line_number)
@@ -150,6 +161,7 @@ alter table public.contract_items add column if not exists device_model text;
 alter table public.contract_items add column if not exists taxable boolean not null default false;
 alter table public.request_items  add column if not exists taxable boolean not null default false;
 
+alter table public.contract_items add column if not exists equipment_description text;
 alter table public.contracts add column if not exists vat_line_number integer;
 alter table public.contracts add column if not exists vat_line_value numeric(14,2) check (vat_line_value > 0);
 alter table public.request_items add column if not exists is_vat boolean not null default false;
@@ -168,6 +180,7 @@ create index if not exists idx_requests_status      on public.requests(status);
 create index if not exists idx_request_items_req    on public.request_items(request_id);
 create index if not exists idx_request_items_dup    on public.request_items(part_number, serial_number);
 create index if not exists idx_contract_items_con   on public.contract_items(contract_id);
+create index if not exists idx_vendor_contacts_vendor on public.vendor_contacts(vendor_id);
 create index if not exists idx_notifications_user   on public.notifications(user_id, created_at desc);
 
 -- ---------------------------------------------------------------------
@@ -294,7 +307,7 @@ end $$;
 do $$
 declare t text;
 begin
-  foreach t in array array['profiles','team_memberships','vendors','contracts','contract_items',
+  foreach t in array array['profiles','team_memberships','vendors','vendor_contacts','contracts','contract_items',
                            'requests','request_items','app_settings'] loop
     execute format('drop trigger if exists audit_%1$s on public.%1$s', t);
     execute format('create trigger audit_%1$s after insert or update or delete on public.%1$s
@@ -308,6 +321,7 @@ end $$;
 alter table public.profiles          enable row level security;
 alter table public.team_memberships  enable row level security;
 alter table public.vendors           enable row level security;
+alter table public.vendor_contacts   enable row level security;
 alter table public.contracts         enable row level security;
 alter table public.contract_items    enable row level security;
 alter table public.requests          enable row level security;
@@ -320,7 +334,7 @@ do $$
 declare p record;
 begin
   for p in select policyname, tablename from pg_policies where schemaname = 'public'
-           and tablename in ('profiles','team_memberships','vendors','contracts','contract_items',
+           and tablename in ('profiles','team_memberships','vendors','vendor_contacts','contracts','contract_items',
                              'requests','request_items','notifications','audit_log','app_settings') loop
     execute format('drop policy %I on public.%I', p.policyname, p.tablename);
   end loop;
@@ -343,6 +357,10 @@ create policy team_delete on public.team_memberships for delete to authenticated
 -- write = admin or supervisor.
 create policy vendors_select on public.vendors for select to authenticated using (public.is_active_user());
 create policy vendors_write  on public.vendors for all to authenticated
+  using (public.is_admin() or public.is_supervisor()) with check (public.is_admin() or public.is_supervisor());
+
+create policy vendor_contacts_select on public.vendor_contacts for select to authenticated using (public.is_active_user());
+create policy vendor_contacts_write  on public.vendor_contacts for all to authenticated
   using (public.is_admin() or public.is_supervisor()) with check (public.is_admin() or public.is_supervisor());
 
 create policy contracts_select on public.contracts for select to authenticated using (public.is_active_user());
@@ -430,7 +448,8 @@ language sql security definer set search_path = public as $$
                             equipment_description, device_model, taxable)
   select p_request_id, ci.id, ci.part_number, ci.description, ci.unit_price, (it->>'quantity')::integer,
          trim(it->>'htm_number'), trim(it->>'serial_number'), trim(it->>'work_order_number'), ci.line_number,
-         coalesce(trim(it->>'equipment_description'), ''),
+         -- equipment description and model come from the contract line; typed values only fill a blank
+         coalesce(nullif(trim(ci.equipment_description), ''), trim(it->>'equipment_description'), ''),
          -- model comes from the contract line; a value typed on the request only fills a blank
          coalesce(nullif(trim(ci.device_model), ''), trim(it->>'device_model'), ''),
          ci.taxable
@@ -783,7 +802,7 @@ end $$;
 do $$
 declare t text; f record;
 begin
-  foreach t in array array['profiles','team_memberships','vendors','contracts','contract_items','requests',
+  foreach t in array array['profiles','team_memberships','vendors','vendor_contacts','contracts','contract_items','requests',
                            'request_items','notifications','audit_log','app_settings','contract_balances'] loop
     execute format('revoke all on public.%I from anon', t);
     execute format('grant select, insert, update, delete on public.%I to authenticated', t);

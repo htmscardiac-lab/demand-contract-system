@@ -11,6 +11,7 @@ import Requests from './pages/Requests.jsx'
 const Contracts = lazy(() => import('./pages/Contracts.jsx'))
 const NewRequest = lazy(() => import('./pages/NewRequest.jsx'))
 const Reports = lazy(() => import('./pages/Reports.jsx'))
+const Vendors = lazy(() => import('./pages/Vendors.jsx'))
 const Admin = lazy(() => import('./pages/Admin.jsx'))
 
 const Ctx = createContext(null)
@@ -103,6 +104,7 @@ function Sidebar({ counts, onNavigate }) {
       { to: '/', label: 'Overview', icon: 'overview' },
       { to: '/requests', label: 'Requests', icon: 'requests', badge: counts.action },
       { to: '/contracts', label: 'Contracts', icon: 'contracts' },
+      { to: '/vendors', label: 'Vendors', icon: 'users' },
     ] },
     { label: 'Insights', links: [{ to: '/reports', label: 'Reports', icon: 'reports' }] },
     ...(role === 'admin' ? [{ label: 'System', links: [{ to: '/admin', label: 'Administration', icon: 'admin' }] }] : []),
@@ -262,6 +264,7 @@ export default function App() {
           <Route path="/requests" element={<Requests />} />
           <Route path="/approvals" element={<Navigate to="/requests" replace />} />
           <Route path="/clinical" element={<Navigate to="/requests" replace />} />
+          <Route path="/vendors" element={<Vendors />} />
           <Route path="/reports" element={<Reports />} />
           <Route path="/admin" element={profile.role === 'admin' ? <Admin /> : <Navigate to="/" replace />} />
           <Route path="*" element={<Navigate to="/" replace />} />

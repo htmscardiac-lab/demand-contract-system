@@ -47,6 +47,27 @@ export function vatFor(taxableSubtotal, vatLineValue) {
 export const fmtQty = (n) => String(Number(Number(n ?? 0).toFixed(4)))
 export const partsTotal = (r) => (r.request_items || []).filter(i => !i.is_vat).reduce((s, i) => s + i.unit_price * i.quantity, 0)
 export const vatTotal = (r) => (r.request_items || []).filter(i => i.is_vat).reduce((s, i) => s + i.unit_price * i.quantity, 0)
+// Devices on a request: lines that share HTM, serial and work order belong to one device.
+export function groupByDevice(items = []) {
+  const map = new Map()
+  for (const it of items.filter(i => !i.is_vat)) {
+    const key = [it.htm_number, it.serial_number, it.work_order_number].join('|')
+    if (!map.has(key)) map.set(key, { key, htm: it.htm_number, serial: it.serial_number, wo: it.work_order_number, lines: [] })
+    map.get(key).lines.push(it)
+  }
+  return [...map.values()]
+}
+// Parts on a request with the total across devices.
+export function groupByPart(items = []) {
+  const map = new Map()
+  for (const it of items.filter(i => !i.is_vat)) {
+    const key = `${it.contract_item_id ?? it.part_number}`
+    if (!map.has(key)) map.set(key, { key, ...it, quantity: 0, received_quantity: 0, lines: [] })
+    const g = map.get(key)
+    g.quantity += Number(it.quantity); g.received_quantity += Number(it.received_quantity || 0); g.lines.push(it)
+  }
+  return [...map.values()]
+}
 export const requestTotal = (r) => (r.request_items || []).reduce((s, i) => s + i.unit_price * i.quantity, 0)
 export const isOverdue = (r) => ['in_process', 'approved'].includes(r.status) && r.promise_date
   && new Date(r.promise_date) < new Date(new Date().toDateString())
@@ -91,18 +112,33 @@ export function buildTimeline(r) {
 const esc = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 
 // Vendor release email — matches the department's standard format (see sample).
+// Lines of a request as the vendor needs them: one row per contract line (a part requested
+// for several devices is summed), parts first, VAT line last.
+export function releaseLines(items = []) {
+  const map = new Map()
+  for (const it of [...items].sort((x, y) => x.id - y.id)) {
+    const key = it.is_vat ? 'vat' : `${it.contract_item_id ?? it.part_number}`
+    const row = map.get(key)
+    if (row) row.quantity += Number(it.quantity)
+    else map.set(key, { ...it, quantity: Number(it.quantity) })
+  }
+  return [...map.values()].sort((x, y) => (x.is_vat ? 1 : 0) - (y.is_vat ? 1 : 0))
+}
+
 export function buildApprovalEmail(req, settings = {}) {
   const deptEmail = settings.department_email || ''
   const deptName = settings.department_name || 'Healthcare Technology Management Services (HTMS)'
   const c = req.contracts
-  // parts in contract-line order as entered, VAT line last
-  const items = [...(req.request_items || [])].sort((a, b) => (a.is_vat ? 1 : 0) - (b.is_vat ? 1 : 0) || a.id - b.id)
+  const contacts = (c?.vendors?.vendor_contacts || []).filter(x => (x.email || '').trim())
+  const to = [...new Set(contacts.map(x => x.email.trim()))]
+  const items = releaseLines(req.request_items)
   const total = items.reduce((s, it) => s + it.unit_price * it.quantity, 0)
   const rel = req.release_number || ''
+  const ref = `${c?.po_number ?? ''} – ${rel}`          // P.O number – release
   const promised = req.promise_date
     ? new Date(req.promise_date).toLocaleDateString('en-GB').replace(/\//g, '-')  // dd-mm-yyyy
     : ''
-  const subject = `Blanket Release ${rel} — Demand Contract ${c?.contract_number ?? ''}`.trim()
+  const subject = `Request Under Demand Contract, P.O: ${ref}`
 
   const rowsText = items.map(it =>
     `${it.line_number ?? ''} | ${it.description} | ${fmtQty(it.quantity)} | ${it.equipment_description || ''} | ${it.device_model || ''}`)
@@ -110,7 +146,7 @@ export function buildApprovalEmail(req, settings = {}) {
     'Dear Engr. ______________,',
     'Greetings.',
     '',
-    `Be informed that a Blanket Release ${rel} has been approved under demand contract for the parts listed below.`,
+    `Be informed that a Blanket Release ${ref} has been approved under demand contract for the parts listed below.`,
     `Promised Date: ${promised}`,
     '',
     'Line | Line Description | QTY | Equipment Description | Model',
@@ -126,7 +162,7 @@ export function buildApprovalEmail(req, settings = {}) {
 
   const html = `<html><body style="font-family:Calibri,Arial,sans-serif;font-size:11pt;color:#1f2937">
 <p>Dear Engr. ______________,<br>Greetings.</p>
-<p>Be informed that a <b>Blanket Release ${esc(rel)}</b> has been approved under demand contract for the parts listed below.<br>
+<p>Be informed that a <b>Blanket Release ${esc(ref)}</b> has been approved under demand contract for the parts listed below.<br>
 <b>Promised Date:</b> ${esc(promised)}</p>
 <table cellpadding="6" cellspacing="0" border="1" style="border-collapse:collapse;font-size:10pt">
 <thead><tr style="background:#dbe5f1">
@@ -136,15 +172,18 @@ export function buildApprovalEmail(req, settings = {}) {
 <p>Best regards,<br>${esc(deptName)}</p>
 </body></html>`
 
-  const mailto = `mailto:${deptEmail}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`
-  return { subject, body, html, mailto, total, deptEmail, deptName }
+  const mailto = `mailto:${to.join(',')}?${deptEmail ? `cc=${encodeURIComponent(deptEmail)}&` : ''}subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`
+  return { subject, body, html, mailto, total, to, cc: deptEmail, deptEmail, deptName }
 }
 
+// RFC 2047 header value, so the dash in the subject survives in Outlook
+const encHeader = (v) => '=?UTF-8?B?' + btoa(String.fromCharCode(...new TextEncoder().encode(v))) + '?='
+
 export function downloadOutlookEmail(req, settings = {}) {
-  const { subject, html, body, deptEmail } = buildApprovalEmail(req, settings)
+  const { subject, html, body, to, cc } = buildApprovalEmail(req, settings)
   const boundary = '----=_DCS_' + Date.now()
   const eml = [
-    `To: ${deptEmail}`, `Subject: ${subject}`, 'X-Unsent: 1', 'MIME-Version: 1.0',
+    `To: ${to.join(', ')}`, ...(cc ? [`Cc: ${cc}`] : []), `Subject: ${encHeader(subject)}`, 'X-Unsent: 1', 'MIME-Version: 1.0',
     `Content-Type: multipart/alternative; boundary="${boundary}"`, '',
     `--${boundary}`, 'Content-Type: text/plain; charset="utf-8"', 'Content-Transfer-Encoding: 8bit', '', body, '',
     `--${boundary}`, 'Content-Type: text/html; charset="utf-8"', 'Content-Transfer-Encoding: 8bit', '', html, '',

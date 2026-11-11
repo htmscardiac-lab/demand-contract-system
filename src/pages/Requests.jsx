@@ -5,11 +5,11 @@ import { useApp } from '../App.jsx'
 import { usePoll } from '../lib/poll.js'
 import { Card, Btn, Input, Select, Textarea, Badge, Modal, Drawer, Spinner, Empty, PageTitle, Alert, TableWrap, Th, Td, Row,
          Tabs, SearchInput, Field, Meter, Icon } from '../ui.jsx'
-import { money, fmtDate, fmtDateTime, STATUS_STYLE, statusLabel, receiptLabel, actionFor, requestTotal, isOverdue, fmtQty,
+import { money, fmtDate, fmtDateTime, STATUS_STYLE, statusLabel, receiptLabel, actionFor, requestTotal, isOverdue, fmtQty, groupByDevice, groupByPart,
          ACTIVE_STATUSES, DONE_STATUSES, buildTimeline, buildApprovalEmail, downloadOutlookEmail } from '../lib/helpers'
 
 export const REQUEST_QUERY = `*, request_items(*),
-  contracts(id, contract_number, po_number, vendors(name, contact_email)),
+  contracts(id, contract_number, po_number, vendors(name, vendor_contacts(name, email, phone))),
   engineer:profiles!requests_engineer_id_fkey(id, full_name),
   supervisor:profiles!requests_supervisor_id_fkey(id, full_name)`
 
@@ -185,6 +185,7 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
   const [status, setStatus] = useState(r.status)
   const [reason, setReason] = useState('')
   const [modal, setModal] = useState(null)
+  const [by, setBy] = useState('device')   // how the parts are grouped: by device or by part
   const [recvItem, setRecvItem] = useState(null)
   const [recvQty, setRecvQty] = useState(1)
   const [err, setErr] = useState('')
@@ -196,6 +197,27 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
   const parts = items.filter(i => !i.is_vat)
   const vatLine = items.find(i => i.is_vat)
   const partsSum = parts.reduce((s, i) => s + i.unit_price * i.quantity, 0)
+  const deviceGroups = groupByDevice(items)
+  const partGroups = groupByPart(items)
+  const partOf = (it) => partGroups.find(g => g.lines.some(l => l.id === it.id))
+  // receipt status and buttons of one request line
+  const receipt = (it) => {
+    if (!canTrack) return null
+    const outstanding = it.quantity - (it.received_quantity || 0)
+    return (
+      <div className="flex flex-wrap items-center justify-between gap-2 mt-3">
+        {outstanding === 0
+          ? <Badge className="bg-olive-100 text-olive-700"><Icon name="check" className="w-3 h-3" strokeWidth={2.6} />Received</Badge>
+          : <Badge className={it.received_quantity > 0 ? 'bg-amber-100 text-amber-700' : 'bg-ink-100 text-ink-600'}>{receiptLabel(it)}</Badge>}
+        {outstanding > 0 && (
+          <div className="flex gap-2">
+            <Btn size="sm" variant="secondary" disabled={busy} onClick={() => { setRecvItem(it); setRecvQty(outstanding); setModal('receive') }}>Receive some</Btn>
+            <Btn size="sm" variant="success" disabled={busy} onClick={() => call('receive_items', { p_item_id: it.id, p_quantity: outstanding }, 'Line received in full.', refresh)}>Receive all {fmtQty(outstanding)}</Btn>
+          </div>
+        )}
+      </div>
+    )
+  }
   const isOwner = r.engineer?.id === profile.id
   const isSup = r.supervisor?.id === profile.id
   const admin = profile.role === 'admin'
@@ -293,51 +315,83 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
 
       <Card className="overflow-hidden">
         <div className="flex flex-wrap items-center justify-between gap-2 px-5 py-3.5 border-b border-ink-100">
-          <h4 className="font-display font-semibold text-[13px] tracking-[0.08em] uppercase text-ink-500">Parts and devices · {parts.length}</h4>
+          <h4 className="font-display font-semibold text-[13px] tracking-[0.08em] uppercase text-ink-500">Parts · {partGroups.length} for {deviceGroups.length} device{deviceGroups.length === 1 ? '' : 's'}</h4>
+          <div className="inline-flex rounded-lg border border-ink-300 overflow-hidden text-[13px] font-medium" role="group" aria-label="Group parts">
+            {[['device', 'By device'], ['part', 'By part']].map(([k, label]) => (
+              <button key={k} onClick={() => setBy(k)} aria-pressed={by === k}
+                className={`h-8 px-3 transition-colors ${by === k ? 'bg-ink-900 text-white' : 'bg-white text-ink-700 hover:bg-ink-50'}`}>{label}</button>
+            ))}
+          </div>
           {canTrack && items.some(i => i.quantity > (i.received_quantity || 0)) && (
             <Btn size="sm" variant="secondary" icon="box" disabled={busy} onClick={() => call('receive_all', { p_request_id: r.id }, 'All outstanding parts received.', refresh)}>Receive all outstanding</Btn>
           )}
         </div>
         <ul>
-          {parts.map(it => {
-            const outstanding = it.quantity - (it.received_quantity || 0)
-            return (
-              <li key={it.id} className="px-5 py-4 border-b border-ink-100 last:border-0">
-                <div className="flex items-start justify-between gap-4">
-                  <div className="min-w-0">
-                    <div className="text-sm font-medium text-ink-900">{it.description}</div>
-                    <div className="num text-[12px] text-ink-500 mt-0.5">{it.line_number ? `Line ${it.line_number} · ` : ''}{it.part_number}</div>
-                    {!!it.taxable && <Badge className="bg-gold-100 text-gold-700 mt-1.5">VAT applies</Badge>}
-                  </div>
-                  <div className="text-right shrink-0">
-                    <div className="num text-sm font-medium text-ink-900">{money(it.unit_price * it.quantity)}</div>
-                    <div className="text-[12px] text-ink-500 mt-0.5"><span className="num">{fmtQty(it.quantity)} × {money(it.unit_price)}</span> before VAT</div>
+          {by === 'device' && deviceGroups.map((d, di) => (
+            <li key={d.key} className="border-b border-ink-100 last:border-0">
+              <dl className="flex flex-wrap gap-x-8 gap-y-2 px-5 py-3 bg-ink-50">
+                <Field label={`Device ${di + 1} · HTM`}><span className="num text-[13px] font-medium">{d.htm}</span></Field>
+                <Field label="Serial"><span className="num text-[13px] font-medium">{d.serial}</span></Field>
+                <Field label="Work order"><span className="num text-[13px] font-medium">{d.wo}</span></Field>
+              </dl>
+              <ul>
+                {d.lines.map(it => {
+                  const g = partOf(it)
+                  return (
+                    <li key={it.id} className="px-5 py-3.5 border-t border-ink-100">
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="min-w-0">
+                          <div className="text-sm font-medium text-ink-900">{it.description}</div>
+                          <div className="text-[12px] text-ink-500 mt-0.5">
+                            <span className="num">{it.line_number ? `Line ${it.line_number} · ` : ''}{it.part_number}</span>
+                            {(it.equipment_description || it.device_model) && <> · {[it.equipment_description, it.device_model].filter(Boolean).join(', ')}</>}
+                            {!!it.taxable && <Badge className="bg-gold-100 text-gold-700 ml-2">VAT</Badge>}
+                          </div>
+                          {g && g.lines.length > 1 && (
+                            <div className="text-[12px] text-steel-700 mt-1">Request total for this part: <span className="num font-medium">{fmtQty(g.quantity)}</span> across {g.lines.length} devices</div>
+                          )}
+                        </div>
+                        <div className="text-right shrink-0">
+                          <div className="num text-sm font-medium text-ink-900">{money(it.unit_price * it.quantity)}</div>
+                          <div className="text-[12px] text-ink-500 mt-0.5"><span className="num">{fmtQty(it.quantity)} × {money(it.unit_price)}</span> before VAT</div>
+                        </div>
+                      </div>
+                      {receipt(it)}
+                    </li>
+                  )
+                })}
+              </ul>
+            </li>
+          ))}
+          {by === 'part' && partGroups.map(g => (
+            <li key={g.key} className="px-5 py-4 border-b border-ink-100 last:border-0">
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0">
+                  <div className="text-sm font-medium text-ink-900">{g.description}</div>
+                  <div className="text-[12px] text-ink-500 mt-0.5">
+                    <span className="num">{g.line_number ? `Line ${g.line_number} · ` : ''}{g.part_number}</span>
+                    {(g.equipment_description || g.device_model) && <> · {[g.equipment_description, g.device_model].filter(Boolean).join(', ')}</>}
+                    {!!g.taxable && <Badge className="bg-gold-100 text-gold-700 ml-2">VAT</Badge>}
                   </div>
                 </div>
-                <dl className="grid grid-cols-3 gap-3 mt-3 rounded-lg bg-ink-50 px-3 py-2.5">
-                  <Field label="HTM no."><span className="num text-[13px]">{it.htm_number}</span></Field>
-                  <Field label="Serial no."><span className="num text-[13px]">{it.serial_number}</span></Field>
-                  <Field label="Work order"><span className="num text-[13px]">{it.work_order_number}</span></Field>
-                  {(it.equipment_description || it.device_model) && (
-                    <Field label="Equipment" className="col-span-3"><span className="text-[13px]">{[it.equipment_description, it.device_model].filter(Boolean).join(' · ')}</span></Field>
-                  )}
-                </dl>
-                {canTrack && (
-                  <div className="flex flex-wrap items-center justify-between gap-2 mt-3">
-                    {outstanding === 0
-                      ? <Badge className="bg-olive-100 text-olive-700"><Icon name="check" className="w-3 h-3" strokeWidth={2.6} />Received</Badge>
-                      : <Badge className={it.received_quantity > 0 ? 'bg-amber-100 text-amber-700' : 'bg-ink-100 text-ink-600'}>{receiptLabel(it)}</Badge>}
-                    {outstanding > 0 && (
-                      <div className="flex gap-2">
-                        <Btn size="sm" variant="secondary" disabled={busy} onClick={() => { setRecvItem(it); setRecvQty(outstanding); setModal('receive') }}>Receive some</Btn>
-                        <Btn size="sm" variant="success" disabled={busy} onClick={() => call('receive_items', { p_item_id: it.id, p_quantity: outstanding }, 'Line received in full.', refresh)}>Receive all {outstanding}</Btn>
-                      </div>
-                    )}
-                  </div>
-                )}
-              </li>
-            )
-          })}
+                <div className="text-right shrink-0">
+                  <div className="num text-sm font-medium text-ink-900">{money(g.unit_price * g.quantity)}</div>
+                  <div className="text-[12px] text-ink-500 mt-0.5">Total <span className="num font-medium text-ink-900">{fmtQty(g.quantity)}</span> × <span className="num">{money(g.unit_price)}</span>{g.lines.length > 1 && <> · {g.lines.length} devices</>}</div>
+                </div>
+              </div>
+              <ul className="mt-3 rounded-lg bg-ink-50 divide-y divide-ink-200">
+                {g.lines.map(it => (
+                  <li key={it.id} className="px-3 py-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-1 text-[13px]">
+                      <span className="num text-ink-700">HTM {it.htm_number} · SN {it.serial_number} · W.O {it.work_order_number}</span>
+                      <span className="text-ink-900">Quantity <span className="num font-medium">{fmtQty(it.quantity)}</span></span>
+                    </div>
+                    {receipt(it)}
+                  </li>
+                ))}
+              </ul>
+            </li>
+          ))}
           {vatLine && (
             <li className="px-5 py-4 bg-gold-100/40 border-t border-gold-200">
               <div className="flex items-start justify-between gap-4">
@@ -447,9 +501,10 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
       </Modal>
 
       <Modal open={modal === 'email'} onClose={() => setModal(null)} title="Release email" wide>
-        {!email.deptEmail && <Alert kind="warn">No recipient is set. Add the address in Outlook, or set a default under Administration → Settings.</Alert>}
+        {email.to.length === 0 && <Alert kind="warn">{r.contracts?.vendors?.name} has no contact email in the vendor directory. Add one under Vendors, or type the recipient in Outlook.</Alert>}
         <dl className="grid gap-3 mb-4">
-          <Field label="To">{email.deptEmail || 'Add in Outlook'}</Field>
+          <Field label="To (vendor contacts)">{email.to.length ? email.to.join(', ') : 'Add in Outlook'}</Field>
+          <Field label="CC (department)">{email.cc || 'Not set. Add it under Administration → Settings.'}</Field>
           <Field label="Subject">{email.subject}</Field>
         </dl>
         <pre className="num bg-ink-50 border border-ink-200 rounded-lg p-4 text-[12px] leading-relaxed whitespace-pre-wrap overflow-x-auto max-h-72">{email.body}</pre>

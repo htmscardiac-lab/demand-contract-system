@@ -13,7 +13,7 @@ export default function Contracts() {
   const [sel, setSel] = useState(null)
   const [items, setItems] = useState([])
   const [showNew, setShowNew] = useState(false)
-  const [showVendors, setShowVendors] = useState(false)
+  const [showImport, setShowImport] = useState(false)
   const [err, setErr] = useState('')
   const [search, setSearch] = useState('')
   const [sortBy, setSortBy] = useState('created')
@@ -24,7 +24,7 @@ export default function Contracts() {
     const [{ data: c }, { data: b }, { data: v }] = await Promise.all([
       supabase.from('contracts').select('*, vendors(id, name, contact_email)').order('created_at', { ascending: false }),
       supabase.from('contract_balances').select('*'),
-      supabase.from('vendors').select('*').order('name'),
+      supabase.from('vendors').select('id, name, vendor_contacts(id, name, email, phone)').order('name'),
     ])
     setContracts(c || [])
     setBals(Object.fromEntries((b || []).map(x => [x.contract_id, x])))
@@ -70,7 +70,7 @@ export default function Contracts() {
       <PageTitle subtitle="Demand contracts, their line items and remaining balance."
         right={<>
           <Btn variant="secondary" icon="download" onClick={exportAll} disabled={exporting || contracts.length === 0}>{exporting ? 'Exporting…' : 'Export PDF'}</Btn>
-          {canEdit && <Btn variant="secondary" onClick={() => setShowVendors(true)}>Vendors</Btn>}
+          {canEdit && <Btn variant="secondary" icon="upload" onClick={() => setShowImport(true)}>Import from Excel</Btn>}
           {canEdit && <Btn icon="plus" onClick={() => setShowNew(true)}>New contract</Btn>}
         </>}>Contracts</PageTitle>
       {err && <Alert>{err}</Alert>}
@@ -148,7 +148,7 @@ export default function Contracts() {
         )}
       </Card>
       <NewContractModal open={showNew} onClose={() => setShowNew(false)} vendors={vendors} onSaved={() => { setShowNew(false); load() }} profile={profile} />
-      <VendorsModal open={showVendors} onClose={() => { setShowVendors(false); load() }} vendors={vendors} />
+      <ImportContractsModal open={showImport} onClose={() => { setShowImport(false); load() }} vendors={vendors} profile={profile} />
     </div>
   )
 }
@@ -165,22 +165,29 @@ const lineError = (error) => /duplicate|unique/i.test(error.message)
   : error.message
 
 function NewContractModal({ open, onClose, vendors, onSaved, profile }) {
-  const empty = { contract_number: '', po_number: '', vendor_name: '', vendor_email: '', total_amount: '', previous_consumed_amount: '0', start_date: '', end_date: '', vat_line_number: '', vat_line_value: '' }
+  const empty = { contract_number: '', po_number: '', vendor_name: '', contact_name: '', contact_email: '', contact_phone: '', total_amount: '', previous_consumed_amount: '0', start_date: '', end_date: '', vat_line_number: '', vat_line_value: '' }
   const [f, setF] = useState(empty)
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
   const set = k => e => setF(x => ({ ...x, [k]: e.target.value }))
   const existing = vendors.find(v => v.name.trim().toLowerCase() === f.vendor_name.trim().toLowerCase())
+  // a new vendor needs one contact: a name plus an email or a mobile number
+  const hasContact = f.contact_name.trim() !== '' && (f.contact_email.trim() !== '' || f.contact_phone.trim() !== '')
+  const contactBlank = !f.contact_name.trim() && !f.contact_email.trim() && !f.contact_phone.trim()
+  const contactOk = existing ? (contactBlank || hasContact) : hasContact
   const save = async () => {
     setErr(''); setBusy(true)
     try {
       let vendorId = existing?.id
       if (!vendorId) {
-        const { data, error } = await supabase.from('vendors')
-          .insert({ name: f.vendor_name.trim(), contact_email: f.vendor_email.trim() || null })
-          .select('id').single()
+        const { data, error } = await supabase.from('vendors').insert({ name: f.vendor_name.trim() }).select('id').single()
         if (error) throw error
         vendorId = data.id
+      }
+      if (f.contact_name.trim()) {
+        const { error } = await supabase.from('vendor_contacts').insert({
+          vendor_id: vendorId, name: f.contact_name.trim(), email: f.contact_email.trim() || null, phone: f.contact_phone.trim() || null })
+        if (error) throw error
       }
       const { error } = await supabase.from('contracts').insert({
         contract_number: f.contract_number.trim(), po_number: f.po_number.trim(),
@@ -200,21 +207,23 @@ function NewContractModal({ open, onClose, vendors, onSaved, profile }) {
       <div className="grid gap-4 sm:grid-cols-2">
         <Input label="Contract number" value={f.contract_number} onChange={set('contract_number')} />
         <Input label="PO number" value={f.po_number} onChange={set('po_number')} />
-        <div>
-          <Input label="Vendor" list="vendor-list" value={f.vendor_name} onChange={set('vendor_name')}
-            placeholder="Start typing a vendor name" autoComplete="off" />
-          <datalist id="vendor-list">
-            {vendors.map(v => <option key={v.id} value={v.name} />)}
-          </datalist>
-          {f.vendor_name.trim() !== '' && (
-            existing
-              ? <p className="text-[12px] text-olive-700 mt-1.5">Existing vendor.</p>
-              : <p className="text-[12px] text-steel-700 mt-1.5">New vendor. It is added when you save.</p>
-          )}
+        <div className="sm:col-span-2 rounded-lg border border-ink-200 p-4">
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="sm:col-span-2">
+              <Input label="Vendor" list="vendor-list" value={f.vendor_name} onChange={set('vendor_name')}
+                placeholder="Start typing a vendor name" autoComplete="off" />
+              <datalist id="vendor-list">
+                {vendors.map(v => <option key={v.id} value={v.name} />)}
+              </datalist>
+              {f.vendor_name.trim() !== '' && (existing
+                ? <p className="text-[12px] text-olive-700 mt-1.5">Already in the vendor directory with {existing.vendor_contacts?.length || 0} contact{existing.vendor_contacts?.length === 1 ? '' : 's'}. Fill the fields below only to add another contact.</p>
+                : <p className="text-[12px] text-steel-700 mt-1.5">New vendor. It is added to the vendor directory with this contact when you save.</p>)}
+            </div>
+            <div className="sm:col-span-2"><Input label={existing ? 'Contact name (optional)' : 'Contact name'} value={f.contact_name} onChange={set('contact_name')} /></div>
+            <Input label="Contact email" type="email" value={f.contact_email} onChange={set('contact_email')} />
+            <Input label="Contact mobile" type="tel" value={f.contact_phone} onChange={set('contact_phone')} />
+          </div>
         </div>
-        {!existing && f.vendor_name.trim() !== ''
-          ? <Input label="Vendor contact email" type="email" value={f.vendor_email} onChange={set('vendor_email')} placeholder="vendor@example.com" />
-          : <div />}
         <Input label="Total contract amount" type="number" min="0" step="0.01" value={f.total_amount} onChange={set('total_amount')} />
         <Input label="Previously consumed" type="number" min="0" step="0.01" value={f.previous_consumed_amount} onChange={set('previous_consumed_amount')} />
         <Input label="Start date" type="date" value={f.start_date} onChange={set('start_date')} />
@@ -226,7 +235,7 @@ function NewContractModal({ open, onClose, vendors, onSaved, profile }) {
       <p className="text-[13px] text-ink-500 mt-2">The VAT line is the contract line that VAT is released against. Leave both fields empty if no part on this contract is taxed.</p>
       <div className="flex justify-end gap-2 mt-6">
         <Btn variant="secondary" onClick={onClose}>Cancel</Btn>
-        <Btn onClick={save} disabled={busy || !f.contract_number || !f.po_number || !f.vendor_name.trim() || !f.total_amount || !f.start_date || !f.end_date || (f.vat_line_number === '') !== (f.vat_line_value === '')}>
+        <Btn onClick={save} disabled={busy || !f.contract_number || !f.po_number || !f.vendor_name.trim() || !contactOk || !f.total_amount || !f.start_date || !f.end_date || (f.vat_line_number === '') !== (f.vat_line_value === '')}>
           {busy ? 'Saving…' : 'Save contract'}
         </Btn>
       </div>
@@ -234,31 +243,194 @@ function NewContractModal({ open, onClose, vendors, onSaved, profile }) {
   )
 }
 
-function VendorsModal({ open, onClose, vendors }) {
-  const [name, setName] = useState('')
-  const [email, setEmail] = useState('')
+const CONTRACT_COLS = ['Contract Number', 'PO Number', 'Vendor Name', 'Contact Name', 'Contact Email', 'Contact Mobile',
+  'Total Amount', 'Previously Consumed', 'Start Date', 'End Date', 'VAT Line Number', 'VAT Line Value']
+
+// Excel date cell (serial number) or text (2026-01-31, 31/01/2026, 31-01-2026) to yyyy-mm-dd; '' when unreadable.
+function toIsoDate(v) {
+  if (v === '' || v == null) return ''
+  if (typeof v === 'number') return new Date(Date.UTC(1899, 11, 30) + Math.round(v) * 86400000).toISOString().slice(0, 10)
+  const t = String(v).trim()
+  let m = t.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/)
+  if (m) return `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`
+  m = t.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})$/)
+  if (m) return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`
+  return ''
+}
+
+function ImportContractsModal({ open, onClose, vendors, profile }) {
+  const [rows, setRows] = useState(null)
   const [err, setErr] = useState('')
-  const [list, setList] = useState(vendors)
-  useEffect(() => setList(vendors), [vendors])
-  const add = async () => {
-    setErr('')
-    const { error } = await supabase.from('vendors').insert({ name: name.trim(), contact_email: email.trim() || null })
-    if (error) return setErr(error.message)
-    const { data } = await supabase.from('vendors').select('*').order('name')
-    setList(data || []); setName(''); setEmail('')
+  const [busy, setBusy] = useState(false)
+  const [done, setDone] = useState(null)
+  useEffect(() => { if (open) { setRows(null); setErr(''); setDone(null) } }, [open])
+
+  const template = async () => {
+    const XLSX = await import('xlsx')
+    const sheet = XLSX.utils.aoa_to_sheet([CONTRACT_COLS])
+    sheet['!cols'] = CONTRACT_COLS.map(c => ({ wch: Math.max(16, c.length + 4) }))
+    const help = XLSX.utils.aoa_to_sheet([
+      ['How to fill the "Contracts" sheet'], [],
+      ['Column', 'Required', 'What to enter', 'Example'],
+      ['Contract Number', 'Yes', 'Each contract number once.', 'DC-2026-0114'],
+      ['PO Number', 'Yes', 'Purchase order number of the contract.', '448120'],
+      ['Vendor Name', 'Yes', 'A vendor that is not in the directory yet is added automatically.', 'Draeger Arabia'],
+      ['Contact Name', 'For a new vendor', 'Person to contact at the vendor. Added to the vendor directory.', 'Eng. Ahmed Ali'],
+      ['Contact Email', 'Email or mobile', 'The release email is sent to this address.', 'ahmed@vendor.com'],
+      ['Contact Mobile', 'Email or mobile', 'Mobile number of the contact.', '0500000000'],
+      ['Total Amount', 'Yes', 'Total contract value, numbers only.', 850000],
+      ['Previously Consumed', 'No', 'Amount already spent before the contract was added here. Empty counts as 0.', 120000],
+      ['Start Date', 'Yes', 'A date cell, or text as YYYY-MM-DD or DD/MM/YYYY.', '2026-01-01'],
+      ['End Date', 'Yes', 'A date cell, or text as YYYY-MM-DD or DD/MM/YYYY.', '2026-12-31'],
+      ['VAT Line Number', 'No', 'Number of the contract line VAT is released against. Fill together with VAT Line Value.', 25],
+      ['VAT Line Value', 'No', 'Value of one unit of the VAT line.', 100],
+      [], ['Keep the first row (the column titles). One contract per row, starting from row 2. Only the first sheet is read.'],
+      ['Line items are uploaded afterwards, inside each contract.'],
+    ])
+    help['!cols'] = [{ wch: 22 }, { wch: 18 }, { wch: 84 }, { wch: 22 }]
+    const wb = XLSX.utils.book_new()
+    XLSX.utils.book_append_sheet(wb, sheet, 'Contracts')
+    XLSX.utils.book_append_sheet(wb, help, 'How to fill')
+    XLSX.writeFile(wb, 'contracts-template.xlsx')
   }
+
+  const onFile = async (e) => {
+    setErr(''); setDone(null)
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file) return
+    try {
+      const XLSX = await import('xlsx')
+      const wb = XLSX.read(await file.arrayBuffer())
+      let raw = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { header: 1, defval: '' })
+      raw = raw.filter(r => r.some(c => String(c).trim() !== ''))
+      if (raw.length < 2) throw new Error('The sheet has no contracts. Fill at least one row under the column titles.')
+      const head = raw[0].map(h => String(h).toLowerCase())
+      const find = (re) => head.findIndex(h => re.test(h))
+      const col = {
+        number: find(/contract/), po: find(/p\.?\s?o\b|purchase/), vendor: find(/vendor/), cname: find(/contact.*name/),
+        email: find(/mail/), phone: find(/mobile|phone/), total: find(/total/), prev: find(/prev|consumed/),
+        start: find(/\bstart\b/), end: find(/\bend\b/), vatNo: find(/vat.*(number|no)/), vatVal: find(/vat.*value/),
+      }
+      const missing = Object.entries({ 'Contract Number': col.number, 'PO Number': col.po, 'Vendor Name': col.vendor, 'Total Amount': col.total, 'Start Date': col.start, 'End Date': col.end })
+        .filter(([, i]) => i < 0).map(([n]) => n)
+      if (missing.length) throw new Error(`Column${missing.length > 1 ? 's' : ''} not found: ${missing.join(', ')}. Use the Excel template.`)
+      const cell = (r, i) => (i >= 0 ? r[i] ?? '' : '')
+      const text = (r, i) => String(cell(r, i)).trim()
+      const known = new Set(vendors.map(v => v.name.trim().toLowerCase()))
+      const seen = new Set()
+      setRows(raw.slice(1).map((r, i) => {
+        const x = {
+          row: i + 2, contract_number: text(r, col.number), po_number: text(r, col.po), vendor_name: text(r, col.vendor),
+          contact_name: text(r, col.cname), contact_email: text(r, col.email), contact_phone: text(r, col.phone),
+          total_amount: Number(cell(r, col.total)), previous: Number(cell(r, col.prev) || 0),
+          start_date: toIsoDate(cell(r, col.start)), end_date: toIsoDate(cell(r, col.end)),
+          vat_no: text(r, col.vatNo), vat_val: text(r, col.vatVal),
+        }
+        const problems = []
+        if (!x.contract_number) problems.push('contract number missing')
+        else if (seen.has(x.contract_number.toLowerCase())) problems.push('contract number repeated in the file')
+        seen.add(x.contract_number.toLowerCase())
+        if (!x.po_number) problems.push('PO number missing')
+        if (!x.vendor_name) problems.push('vendor name missing')
+        if (!(x.total_amount > 0)) problems.push('total amount not valid')
+        if (isNaN(x.previous) || x.previous < 0) problems.push('previously consumed not valid')
+        if (!x.start_date) problems.push('start date not readable')
+        if (!x.end_date) problems.push('end date not readable')
+        if ((x.vat_no === '') !== (x.vat_val === '')) problems.push('fill both VAT line number and value, or neither')
+        else if (x.vat_no !== '' && !(Number(x.vat_no) > 0 && Number(x.vat_val) > 0)) problems.push('VAT line not valid')
+        const newVendor = x.vendor_name && !known.has(x.vendor_name.toLowerCase())
+        const hasContact = x.contact_name && (x.contact_email || x.contact_phone)
+        if (newVendor && !hasContact) problems.push('new vendor needs a contact name with an email or mobile')
+        if (!x.contact_name && (x.contact_email || x.contact_phone)) problems.push('contact name missing')
+        return { ...x, newVendor, problems }
+      }))
+    } catch (ex) { setErr(ex.message); setRows(null) }
+  }
+
+  const run = async () => {
+    setBusy(true); setErr('')
+    const ids = Object.fromEntries(vendors.map(v => [v.name.trim().toLowerCase(), v.id]))
+    const contacts = Object.fromEntries(vendors.map(v => [v.id, (v.vendor_contacts || []).map(c => `${c.name}|${c.email || ''}`.toLowerCase())]))
+    const failed = []; let ok = 0
+    for (const x of rows.filter(r => r.problems.length === 0)) {
+      try {
+        const key = x.vendor_name.toLowerCase()
+        if (!ids[key]) {
+          const { data, error } = await supabase.from('vendors').insert({ name: x.vendor_name }).select('id').single()
+          if (error) throw error
+          ids[key] = data.id; contacts[data.id] = []
+        }
+        const ckey = `${x.contact_name}|${x.contact_email}`.toLowerCase()
+        if (x.contact_name && !contacts[ids[key]].includes(ckey)) {
+          const { error } = await supabase.from('vendor_contacts').insert({ vendor_id: ids[key], name: x.contact_name, email: x.contact_email || null, phone: x.contact_phone || null })
+          if (error) throw error
+          contacts[ids[key]].push(ckey)
+        }
+        const { error } = await supabase.from('contracts').insert({
+          contract_number: x.contract_number, po_number: x.po_number, vendor_id: ids[key], total_amount: x.total_amount,
+          previous_consumed_amount: x.previous, start_date: x.start_date, end_date: x.end_date, created_by: profile.id,
+          vat_line_number: x.vat_no === '' ? null : Number(x.vat_no), vat_line_value: x.vat_val === '' ? null : Number(x.vat_val),
+        })
+        if (error) throw error
+        ok++
+      } catch (ex) {
+        failed.push({ row: x.row, number: x.contract_number, reason: /duplicate|unique/i.test(ex.message) ? 'a contract with this number already exists' : ex.message })
+      }
+    }
+    setBusy(false); setDone({ ok, failed }); setRows(null)
+  }
+
+  const good = rows ? rows.filter(r => r.problems.length === 0).length : 0
   return (
-    <Modal open={open} onClose={onClose} title="Vendors">
+    <Modal open={open} onClose={onClose} title="Import contracts from Excel" wide>
       {err && <Alert>{err}</Alert>}
-      <div className="grid gap-3 sm:grid-cols-[1fr_1fr_auto] items-end mb-4">
-        <Input label="Vendor name" value={name} onChange={e => setName(e.target.value)} />
-        <Input label="Contact email" type="email" value={email} onChange={e => setEmail(e.target.value)} />
-        <Btn onClick={add} disabled={!name.trim()}>Add vendor</Btn>
-      </div>
-      <TableWrap className="rounded-lg border border-ink-200">
-        <thead><tr><Th>Name</Th><Th>Email</Th></tr></thead>
-        <tbody>{list.map(v => <tr key={v.id}><Td>{v.name}</Td><Td className="text-ink-500">{v.contact_email || '—'}</Td></tr>)}</tbody>
-      </TableWrap>
+      {done && (<>
+        <Alert kind={done.ok ? 'ok' : 'warn'}>{done.ok} contract{done.ok === 1 ? '' : 's'} imported{done.failed.length ? `, ${done.failed.length} not imported` : ''}.</Alert>
+        {done.failed.length > 0 && (
+          <ul className="text-[13px] text-ink-700 space-y-1 mb-4">
+            {done.failed.map(f => <li key={f.row}>Row <span className="num">{f.row}</span> · <span className="num">{f.number}</span>: {f.reason}</li>)}
+          </ul>
+        )}
+      </>)}
+      {!rows && (
+        <ol className="space-y-3">
+          <li className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-ink-200 px-4 py-3">
+            <span className="text-sm text-ink-800"><span className="num text-ink-500 mr-2">1</span>Download the template and fill one contract per row.</span>
+            <Btn variant="secondary" icon="download" onClick={template}>Excel template</Btn>
+          </li>
+          <li className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-ink-200 px-4 py-3">
+            <span className="text-sm text-ink-800"><span className="num text-ink-500 mr-2">2</span>Upload the filled file. You review it before anything is saved.</span>
+            <label className="inline-flex items-center justify-center gap-2 h-9.5 px-4 rounded-lg text-sm font-medium bg-brand-600 hover:bg-brand-700 text-white cursor-pointer transition-colors">
+              <Icon name="upload" className="w-4 h-4" />Choose file
+              <input type="file" accept=".xlsx,.xls,.csv" className="sr-only" onChange={onFile} />
+            </label>
+          </li>
+        </ol>
+      )}
+      {rows && (<>
+        <p className="text-sm text-ink-600 mb-3">{good} of {rows.length} row{rows.length === 1 ? '' : 's'} ready to import.{good < rows.length ? ' Rows with a problem are skipped.' : ''}</p>
+        <TableWrap className="rounded-lg border border-ink-200 max-h-[46vh] overflow-y-auto">
+          <thead><tr><Th>Row</Th><Th>Contract</Th><Th>Vendor</Th><Th right>Total</Th><Th>Period</Th><Th>VAT line</Th><Th>Check</Th></tr></thead>
+          <tbody>
+            {rows.map(x => (
+              <tr key={x.row} className={x.problems.length ? 'bg-brand-50/60' : ''}>
+                <Td className="num text-ink-500">{x.row}</Td>
+                <Td className="whitespace-nowrap"><div className="font-medium text-ink-900">{x.contract_number || '—'}</div><div className="num text-[12px] text-ink-500">PO {x.po_number || '—'}</div></Td>
+                <Td className="whitespace-nowrap"><div>{x.vendor_name || '—'}</div>{x.newVendor && <div className="text-[12px] text-steel-700">New vendor</div>}{x.contact_name && <div className="text-[12px] text-ink-500">{x.contact_name}</div>}</Td>
+                <Td right className="num">{x.total_amount > 0 ? money(x.total_amount) : '—'}</Td>
+                <Td className="text-[13px] whitespace-nowrap">{x.start_date ? fmtDate(x.start_date) : '—'} – {x.end_date ? fmtDate(x.end_date) : '—'}</Td>
+                <Td className="num text-[13px] whitespace-nowrap">{x.vat_no !== '' ? `${x.vat_no} · ${money(x.vat_val)}` : <span className="text-ink-300">—</span>}</Td>
+                <Td className="text-[13px] min-w-[240px]">{x.problems.length ? <span className="text-brand-700">{x.problems.join('; ')}</span> : <Badge className="bg-olive-100 text-olive-700">Ready</Badge>}</Td>
+              </tr>
+            ))}
+          </tbody>
+        </TableWrap>
+        <div className="flex justify-end gap-2 mt-6">
+          <Btn variant="secondary" onClick={() => setRows(null)}>Choose another file</Btn>
+          <Btn onClick={run} disabled={busy || good === 0}>{busy ? 'Importing…' : `Import ${good} contract${good === 1 ? '' : 's'}`}</Btn>
+        </div>
+      </>)}
     </Modal>
   )
 }
@@ -294,15 +466,26 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
       const ws = wb.Sheets[wb.SheetNames[0]]
       let rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' })
       rows = rows.filter(r => r.length && String(r[0]).trim() !== '')
-      // skip a header row if the first cell is not a number
-      if (rows.length && isNaN(Number(rows[0][0]))) rows = rows.slice(1)
+      // With a title row, columns are found by their titles, so their order does not matter.
+      let col = { line: 0, desc: 1, part: 2, price: 3, model: 4, equip: 5, vat: 6 }
+      if (rows.length && isNaN(Number(rows[0][0]))) {
+        const head = rows[0].map(h => String(h).toLowerCase())
+        const find = (re) => head.findIndex(h => re.test(h))
+        col = { line: find(/line/), part: find(/part/), price: find(/price/), model: find(/model/), equip: find(/equip/), vat: find(/vat|tax/),
+          desc: head.findIndex(h => /desc/.test(h) && !/equip/.test(h)) }
+        rows = rows.slice(1)
+      } else if (rows.length && rows.every(r => r.length <= 6)) {
+        col = { ...col, equip: -1, vat: 5 }   // sheet without titles in the earlier six-column layout
+      }
+      const cell = (r, i) => (i >= 0 ? r[i] ?? '' : '')
       const parsed = rows.map(r => ({
-        line_number: Number(r[0]), description: String(r[1]).trim(),
-        part_number: String(r[2]).trim(), unit_price: Number(r[3]),
-        device_model: String(r[4] ?? '').trim() || null, taxable: isYes(r[5]),
+        line_number: Number(cell(r, col.line)), description: String(cell(r, col.desc)).trim(),
+        part_number: String(cell(r, col.part)).trim(), unit_price: Number(cell(r, col.price)),
+        device_model: String(cell(r, col.model)).trim() || null,
+        equipment_description: String(cell(r, col.equip)).trim() || null, taxable: isYes(cell(r, col.vat)),
       }))
-      const bad = parsed.find(p => !p.line_number || !p.description || !p.part_number || isNaN(p.unit_price))
-      if (bad) throw new Error('Some rows are invalid. Expected columns in order: Line Number, Description, Part Number, Unit Price, Model, VAT (Yes or No). Model and VAT are optional.')
+      const bad = parsed.findIndex((p, i) => !p.line_number || !p.description || !p.part_number || isNaN(p.unit_price) || String(cell(rows[i], col.price)).trim() === '')
+      if (bad >= 0) throw new Error(`Row ${bad + 2} is not valid. Each row needs a line number, description, part number and unit price. Download the Excel template to see the expected columns.`)
       setExcelRows(parsed)
     } catch (ex) { setErr(ex.message) }
     e.target.value = ''
@@ -311,9 +494,9 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
   // Empty Excel sheet with the columns in the order the upload expects.
   const downloadTemplate = async () => {
     const XLSX = await import('xlsx')
-    const cols = ['Line Number', 'Description', 'Part Number', 'Unit Price (before VAT)', 'Model', 'VAT (Yes/No)']
+    const cols = ['Line Number', 'Description', 'Part Number', 'Unit Price (before VAT)', 'Model', 'Equipment Description', 'VAT (Yes/No)']
     const sheet = XLSX.utils.aoa_to_sheet([cols])
-    sheet['!cols'] = [{ wch: 13 }, { wch: 46 }, { wch: 20 }, { wch: 14 }, { wch: 24 }, { wch: 14 }]
+    sheet['!cols'] = [{ wch: 13 }, { wch: 46 }, { wch: 20 }, { wch: 22 }, { wch: 22 }, { wch: 30 }, { wch: 14 }]
     const help = XLSX.utils.aoa_to_sheet([
       ['How to fill the "Line items" sheet'],
       [],
@@ -323,6 +506,7 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
       ['Part Number', 'Yes', 'Vendor part number.', '8403735'],
       ['Unit Price (before VAT)', 'Yes', 'Price of one unit before VAT, numbers only.', 1450],
       ['Model', 'No', 'Device model the part belongs to. It is filled in automatically on requests.', 'Evita V500'],
+      ['Equipment Description', 'No', 'Equipment the model belongs to. It is filled in automatically on requests and in the release email.', 'Ventilator, ICU'],
       ['VAT (Yes/No)', 'No', 'Yes if VAT applies to the part, No if it does not. Empty counts as No.', 'Yes'],
       [],
       ['Do not add the VAT line here. Its line number and value are set on the contract itself.'],
@@ -409,8 +593,8 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
               <Btn onClick={importExcel} disabled={busy}>{busy ? 'Importing…' : `Import ${excelRows.length} line items`}</Btn>
             </div>} />
           <TableWrap>
-            <thead><tr><Th>Line</Th><Th>Description</Th><Th>Part number</Th><Th>Model</Th><Th>VAT</Th><Th right>Unit price before VAT</Th></tr></thead>
-            <tbody>{excelRows.slice(0, 8).map((r, i) => <tr key={i}><Td className="num">{r.line_number}</Td><Td>{r.description}</Td><Td className="num text-[13px]">{r.part_number}</Td><Td>{r.device_model || <span className="text-ink-300">—</span>}</Td><Td><VatBadge on={r.taxable} /></Td><Td right className="num">{money(r.unit_price)}</Td></tr>)}</tbody>
+            <thead><tr><Th>Line</Th><Th>Description</Th><Th>Part number</Th><Th>Model and equipment</Th><Th>VAT</Th><Th right>Unit price before VAT</Th></tr></thead>
+            <tbody>{excelRows.slice(0, 8).map((r, i) => <tr key={i}><Td className="num">{r.line_number}</Td><Td>{r.description}</Td><Td className="num text-[13px]">{r.part_number}</Td><Td>{r.device_model || <span className="text-ink-300">—</span>}{r.equipment_description && <div className="text-[12px] text-ink-500">{r.equipment_description}</div>}</Td><Td><VatBadge on={r.taxable} /></Td><Td right className="num">{money(r.unit_price)}</Td></tr>)}</tbody>
           </TableWrap>
           {excelRows.length > 8 && <div className="text-[13px] text-ink-500 px-5 py-3">and {excelRows.length - 8} more rows</div>}
         </Card>
@@ -428,7 +612,7 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
           </div>} />
         {items.length === 0 ? <Empty icon="box" title="No line items yet" hint="Download the Excel template, fill it and upload it, or add line items one by one." /> : (
           <TableWrap>
-            <thead><tr><Th className="w-16">Line</Th><Th className="w-16">Image</Th><Th>Description</Th><Th>Part number</Th><Th>Model</Th><Th>VAT</Th><Th right>Unit price before VAT</Th>{canEdit && <Th></Th>}</tr></thead>
+            <thead><tr><Th className="w-16">Line</Th><Th className="w-16">Image</Th><Th>Description</Th><Th>Part number</Th><Th>Model and equipment</Th><Th>VAT</Th><Th right>Unit price before VAT</Th>{canEdit && <Th></Th>}</tr></thead>
             <tbody>
               {items.map(it => (
                 <tr key={it.id}>
@@ -440,7 +624,7 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
                   </Td>
                   <Td className="max-w-[360px] text-ink-900">{it.description}</Td>
                   <Td className="num text-[13px]">{it.part_number}</Td>
-                  <Td>{it.device_model || <span className="text-ink-300">—</span>}</Td>
+                  <Td>{it.device_model || <span className="text-ink-300">—</span>}{it.equipment_description && <div className="text-[12px] text-ink-500 mt-0.5">{it.equipment_description}</div>}</Td>
                   <Td><VatBadge on={it.taxable} /></Td>
                   <Td right className="num text-ink-900">{money(it.unit_price)}</Td>
                   {canEdit && (
@@ -499,7 +683,7 @@ function VatLineModal({ open, onClose, contract, vat, onSaved }) {
 }
 
 function ItemModal({ open, onClose, contract, onSaved, item }) {
-  const empty = { line_number: '', description: '', part_number: '', unit_price: '', device_model: '', taxable: false }
+  const empty = { line_number: '', description: '', part_number: '', unit_price: '', device_model: '', equipment_description: '', taxable: false }
   const [f, setF] = useState(empty)
   const [err, setErr] = useState('')
   const [busy, setBusy] = useState(false)
@@ -508,14 +692,15 @@ function ItemModal({ open, onClose, contract, onSaved, item }) {
     if (!open) return
     setErr('')
     setF(item ? { line_number: item.line_number, description: item.description, part_number: item.part_number,
-      unit_price: item.unit_price, device_model: item.device_model || '', taxable: !!item.taxable } : empty)
+      unit_price: item.unit_price, device_model: item.device_model || '', equipment_description: item.equipment_description || '', taxable: !!item.taxable } : empty)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, item])
   const save = async () => {
     setErr(''); setBusy(true)
     const row = {
       line_number: Number(f.line_number), description: String(f.description).trim(), part_number: String(f.part_number).trim(),
-      unit_price: Number(f.unit_price), device_model: f.device_model.trim() || null, taxable: f.taxable,
+      unit_price: Number(f.unit_price), device_model: f.device_model.trim() || null,
+      equipment_description: f.equipment_description.trim() || null, taxable: f.taxable,
     }
     const { error } = item
       ? await supabase.from('contract_items').update(row).eq('id', item.id)
@@ -532,7 +717,8 @@ function ItemModal({ open, onClose, contract, onSaved, item }) {
         <Input label="Part number" value={f.part_number} onChange={set('part_number')} />
         <div className="sm:col-span-2"><Input label="Description" value={f.description} onChange={set('description')} /></div>
         <Input label="Model" value={f.device_model} onChange={set('device_model')} placeholder="ASTRAL 150" />
-        <Input label="Unit price before VAT" type="number" min="0" step="0.01" value={f.unit_price} onChange={set('unit_price')} />
+        <Input label="Equipment description" value={f.equipment_description} onChange={set('equipment_description')} placeholder="Ventilators, Sub-Acute" />
+        <div className="sm:col-span-2"><Input label="Unit price before VAT" type="number" min="0" step="0.01" value={f.unit_price} onChange={set('unit_price')} /></div>
         <label className={`sm:col-span-2 flex items-center gap-3 px-4 py-3 rounded-lg border cursor-pointer transition-colors ${f.taxable ? 'border-ink-900 bg-ink-50' : 'border-ink-200 hover:border-ink-400'}`}>
           <input type="checkbox" checked={f.taxable} onChange={e => setF(x => ({ ...x, taxable: e.target.checked }))} className="w-4 h-4 accent-brand-600" />
           <span>
