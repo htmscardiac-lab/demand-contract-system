@@ -5,7 +5,7 @@ import { Card, SectionHead, Btn, Input, Badge, Modal, Spinner, Empty, PageTitle,
 import { money, fmtDate } from '../lib/helpers'
 
 export default function Contracts() {
-  const { profile } = useApp()
+  const { profile, settings } = useApp()
   const canEdit = profile.role === 'admin' || profile.role === 'supervisor'
   const [contracts, setContracts] = useState(null)
   const [bals, setBals] = useState({})
@@ -40,10 +40,10 @@ export default function Contracts() {
 
   const exportAll = async () => {
     setExporting(true)
-    const { data: reqs } = await supabase.from('requests')
-      .select('contract_id, request_items(unit_price, quantity, received_quantity)')
-    const { allContractsPdf } = await import('../lib/report')
-    allContractsPdf({ contracts, balances: Object.values(bals), requests: reqs || [] })
+    try {
+      const [{ loadReportData, overviewReport }, { exportReportPdf }] = await Promise.all([import('../lib/reportData'), import('../lib/reportExport')])
+      await exportReportPdf(overviewReport(await loadReportData(), {}), { by: profile.full_name, department: settings.department_name })
+    } catch (ex) { setErr('Could not build the PDF: ' + ex.message) }
     setExporting(false)
   }
 
@@ -436,6 +436,7 @@ function ImportContractsModal({ open, onClose, vendors, profile }) {
 }
 
 function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
+  const { profile, settings } = useApp()
   const [showAdd, setShowAdd] = useState(false)
   const [editItem, setEditItem] = useState(null)
   const [showVat, setShowVat] = useState(false)
@@ -448,11 +449,8 @@ function ContractDetail({ contract, items, bal, canEdit, onBack, reload }) {
   const exportPdf = async () => {
     setPdfBusy(true); setErr('')
     try {
-      const { data: reqs } = await supabase.from('requests')
-        .select('*, request_items(*), engineer:profiles!requests_engineer_id_fkey(id, full_name)')
-        .eq('contract_id', contract.id).order('submitted_at', { ascending: false })
-      const { contractPdf } = await import('../lib/report')
-      contractPdf({ contract, balance: bal, items, requests: reqs || [] })
+      const [{ loadReportData, contractReport }, { exportReportPdf }] = await Promise.all([import('../lib/reportData'), import('../lib/reportExport')])
+      await exportReportPdf(contractReport(await loadReportData(), {}, contract.id), { by: profile.full_name, department: settings.department_name })
     } catch (ex) { setErr('Could not build the PDF: ' + ex.message) } finally { setPdfBusy(false) }
   }
 

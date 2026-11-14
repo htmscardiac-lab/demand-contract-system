@@ -7,10 +7,11 @@ import { Card, Btn, Input, Select, Textarea, Badge, Modal, Drawer, Spinner, Empt
          Tabs, SearchInput, Field, Meter, Icon } from '../ui.jsx'
 import { MrrModal, MrrReminderModal, unlinkedReceipts } from '../lib/mrr.jsx'
 import { money, fmtDate, fmtDateTime, STATUS_STYLE, statusLabel, receiptLabel, actionFor, requestTotal, isOverdue, fmtQty, groupByDevice, groupByPart, vatQtyFor,
-         ACTIVE_STATUSES, DONE_STATUSES, buildTimeline, buildApprovalEmail, downloadOutlookEmail } from '../lib/helpers'
+         ACTIVE_STATUSES, DONE_STATUSES, buildTimeline, buildApprovalEmail, downloadEml } from '../lib/helpers'
+import { RecipientsPicker, resolveRecipients } from '../lib/recipients.jsx'
 
 export const REQUEST_QUERY = `*, request_items(*), request_receipts(*, receiver:profiles!request_receipts_received_by_fkey(id, full_name)), mrrs(*),
-  contracts(id, contract_number, po_number, vendors(name, vendor_contacts(name, email, phone))),
+  contracts(id, contract_number, po_number, vendors(id, name, vendor_contacts(id, name, email, phone, position))),
   engineer:profiles!requests_engineer_id_fkey(id, full_name),
   supervisor:profiles!requests_supervisor_id_fkey(id, full_name)`
 
@@ -197,7 +198,7 @@ export function ReturnNotes({ reason, notes }) {
 }
 
 export function RequestDetail({ request: r, onClose, decideMode = false }) {
-  const { profile, settings } = useApp()
+  const { profile, settings, prefs } = useApp()
   const navigate = useNavigate()
   const [track, setTrack] = useState({
     release_number: r.release_number || '', release_status: r.release_status || 'in_process',
@@ -268,6 +269,7 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
   const submitReceipt = () => call('receive_lines', { p_request_id: r.id, p_lines: picked.map(l => ({ item_id: l.item.id, quantity: l.quantity })) },
     `Receipt submitted for ${picked.length} line${picked.length === 1 ? '' : 's'}.`, () => { setRecv({}); refresh() })
   const email = buildApprovalEmail(view, settings)
+  const mailTo = (({ to, cc }) => ({ to, cc }))(resolveRecipients(r.contracts?.vendors, settings, prefs))
 
   const refresh = async () => {
     const { data } = await supabase.from('request_items').select('*').eq('request_id', r.id).order('id')
@@ -682,17 +684,15 @@ export function RequestDetail({ request: r, onClose, decideMode = false }) {
       </Modal>
 
       <Modal open={modal === 'email'} onClose={() => setModal(null)} title="Release email" wide>
-        {email.to.length === 0 && <Alert kind="warn">{r.contracts?.vendors?.name} has no contact email in the vendor directory. Add one under Vendors, or type the recipient in Outlook.</Alert>}
+        <RecipientsPicker vendor={r.contracts?.vendors} />
         <dl className="grid gap-3 mb-4">
-          <Field label="To (vendor contacts)">{email.to.length ? email.to.join(', ') : 'Add in Outlook'}</Field>
-          <Field label="CC (department)">{email.cc || 'Not set. Add it under Administration → Settings.'}</Field>
           <Field label="Subject">{email.subject}</Field>
         </dl>
         <pre className="num bg-ink-50 border border-ink-200 rounded-lg p-4 text-[12px] leading-relaxed whitespace-pre-wrap overflow-x-auto max-h-72">{email.body}</pre>
         <p className="text-[13px] text-ink-500 mt-3">The Outlook file opens as a ready-to-send message with a formatted table. Add the engineer's name after "Dear Engr." before sending.</p>
         <div className="flex flex-wrap justify-end gap-2 mt-5">
           <Btn variant="secondary" onClick={async () => { await navigator.clipboard.writeText(`${email.subject}\n\n${email.body}`); setOk('Email text copied.') }}>Copy text</Btn>
-          <Btn icon="download" onClick={() => downloadOutlookEmail(view, settings)}>Open in Outlook</Btn>
+          <Btn icon="download" onClick={() => downloadEml({ ...email, ...mailTo, filename: `${r.request_number}.eml` })}>Open in Outlook</Btn>
         </div>
       </Modal>
     </Drawer>

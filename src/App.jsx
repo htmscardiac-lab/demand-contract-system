@@ -249,10 +249,25 @@ export default function App() {
   }, [])
 
   const uid = session?.user?.id
+  // Personal preferences (email recipients, list views). One row per user.
+  const [prefs, setPrefs] = useState({})
+  const prefsRef = useRef({})
+  const loadPrefs = useCallback(async (id) => {
+    const { data } = await supabase.from('user_prefs').select('data').eq('user_id', id).maybeSingle()
+    prefsRef.current = data?.data || {}; setPrefs(prefsRef.current)
+  }, [])
+  const savePrefs = useCallback(async (patch) => {
+    if (!uid) return
+    const next = { ...prefsRef.current, ...patch }
+    prefsRef.current = next; setPrefs(next)
+    const { error } = await supabase.from('user_prefs').upsert({ user_id: uid, data: next, updated_at: new Date().toISOString() }, { onConflict: 'user_id' })
+    return error ? error.message : null
+  }, [uid])
+
   useEffect(() => {
-    if (uid) { loadProfile(uid); loadSettings() }
-    else setProfile(null)
-  }, [uid, loadProfile, loadSettings])
+    if (uid) { loadProfile(uid); loadSettings(); loadPrefs(uid) }
+    else { setProfile(null); prefsRef.current = {}; setPrefs({}) }
+  }, [uid, loadProfile, loadSettings, loadPrefs])
 
   const signOut = async () => { await supabase.auth.signOut(); navigate('/') }
 
@@ -262,7 +277,7 @@ export default function App() {
   if (!profile.is_active) return <Pending signOut={signOut} refresh={() => loadProfile(session.user.id)} />
 
   return (
-    <Ctx.Provider value={{ session, profile, settings, reloadSettings: loadSettings, signOut,
+    <Ctx.Provider value={{ session, profile, settings, prefs, savePrefs, reloadSettings: loadSettings, signOut,
       isAdmin: profile.role === 'admin', isSupervisor: profile.role === 'supervisor', isEngineer: profile.role === 'engineer' }}>
       <Layout>
         <Suspense fallback={<Spinner />}><Routes>

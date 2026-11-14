@@ -3,6 +3,8 @@ import React, { useEffect, useMemo, useState } from 'react'
 import { supabase } from './supabase'
 import { Btn, Input, Modal, Alert, Field } from '../ui.jsx'
 import { fmtDate, fmtQty, downloadEml, escHtml, vatQtyFor } from './helpers'
+import { useApp } from '../App.jsx'
+import { RecipientsPicker, resolveRecipients } from './recipients.jsx'
 
 const today = () => new Date().toISOString().slice(0, 10)
 const daysSince = (d) => Math.max(0, Math.floor((Date.now() - new Date(d).getTime()) / 86400000))
@@ -58,21 +60,22 @@ export function buildMrrReminder(requests, settings = {}) {
 
 export function MrrReminderModal({ requests, settings, onClose }) {
   const [copied, setCopied] = useState(false)
+  const { prefs } = useApp()
   if (!requests) return null
   const email = buildMrrReminder(requests, settings)
+  const vendor = requests[0]?.contracts?.vendors
+  const { to, cc } = resolveRecipients(vendor, settings, prefs)
   return (
     <Modal open onClose={onClose} title="MRR clearance reminder" wide>
-      {email.to.length === 0 && <Alert kind="warn">{email.vendorName} has no contact email in the vendor directory. Add one under Vendors, or type the recipient in Outlook.</Alert>}
+      <RecipientsPicker vendor={vendor} />
       <dl className="grid gap-3 mb-4">
-        <Field label="To (vendor contacts)">{email.to.length ? email.to.join(', ') : 'Add in Outlook'}</Field>
-        <Field label="CC (department)">{email.cc || 'Not set. Add it under Administration → Settings.'}</Field>
         <Field label="Subject">{email.subject}</Field>
       </dl>
       <pre className="num bg-ink-50 border border-ink-200 rounded-lg p-4 text-[12px] leading-relaxed whitespace-pre-wrap overflow-x-auto max-h-72">{email.body}</pre>
       <p className="text-[13px] text-ink-500 mt-3">The Outlook file opens as a ready-to-send message with a formatted table. Add the name after "Dear Engr." before sending.</p>
       <div className="flex flex-wrap justify-end gap-2 mt-5">
         <Btn variant="secondary" onClick={async () => { await navigator.clipboard.writeText(`${email.subject}\n\n${email.body}`); setCopied(true) }}>{copied ? 'Copied' : 'Copy text'}</Btn>
-        <Btn icon="download" onClick={() => downloadEml({ ...email, filename: `mrr-reminder-${requests.length === 1 ? requests[0].request_number : email.vendorName.replace(/[^a-z0-9]+/gi, '-')}.eml` })}>Open in Outlook</Btn>
+        <Btn icon="download" onClick={() => downloadEml({ ...email, to, cc, filename: `mrr-reminder-${requests.length === 1 ? requests[0].request_number : email.vendorName.replace(/[^a-z0-9]+/gi, '-')}.eml` })}>Open in Outlook</Btn>
       </div>
     </Modal>
   )

@@ -213,6 +213,13 @@ alter table public.request_items alter column received_quantity type numeric(14,
 alter table public.request_items drop constraint if exists request_items_quantity_check;
 alter table public.request_items add constraint request_items_quantity_check check (quantity > 0);
 
+-- Per-user settings kept between sessions: email recipients (colleagues, and To/CC per vendor) and view choices.
+create table if not exists public.user_prefs (
+  user_id     uuid primary key references public.profiles(id) on delete cascade,
+  data        jsonb not null default '{}'::jsonb,
+  updated_at  timestamptz not null default now()
+);
+
 create sequence if not exists public.request_number_seq;
 
 create index if not exists idx_requests_contract    on public.requests(contract_id);
@@ -378,6 +385,7 @@ alter table public.request_items     enable row level security;
 alter table public.notifications     enable row level security;
 alter table public.audit_log         enable row level security;
 alter table public.app_settings      enable row level security;
+alter table public.user_prefs        enable row level security;
 
 do $$
 declare p record;
@@ -385,7 +393,7 @@ begin
   for p in select policyname, tablename from pg_policies where schemaname = 'public'
            and tablename in ('profiles','team_memberships','vendors','vendor_contacts','contact_positions','contact_specialties',
                              'mrrs','request_receipts','contracts','contract_items',
-                             'requests','request_items','notifications','audit_log','app_settings') loop
+                             'requests','request_items','notifications','audit_log','app_settings','user_prefs') loop
     execute format('drop policy %I on public.%I', p.policyname, p.tablename);
   end loop;
 end $$;
@@ -446,6 +454,10 @@ create policy mrrs_select on public.mrrs for select to authenticated
 create policy notifications_select on public.notifications for select to authenticated using (user_id = auth.uid());
 create policy notifications_update on public.notifications for update to authenticated
   using (user_id = auth.uid()) with check (user_id = auth.uid());
+
+create policy user_prefs_select on public.user_prefs for select to authenticated using (user_id = auth.uid());
+create policy user_prefs_insert on public.user_prefs for insert to authenticated with check (user_id = auth.uid());
+create policy user_prefs_update on public.user_prefs for update to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid());
 
 create policy audit_select on public.audit_log for select to authenticated using (public.is_admin());
 
@@ -1019,7 +1031,7 @@ declare t text; f record;
 begin
   foreach t in array array['profiles','team_memberships','vendors','vendor_contacts','contact_positions','contact_specialties',
                            'mrrs','request_receipts','contracts','contract_items','requests',
-                           'request_items','notifications','audit_log','app_settings','contract_balances'] loop
+                           'request_items','notifications','audit_log','app_settings','user_prefs','contract_balances'] loop
     execute format('revoke all on public.%I from anon', t);
     execute format('grant select, insert, update, delete on public.%I to authenticated', t);
   end loop;

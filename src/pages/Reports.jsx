@@ -1,170 +1,192 @@
-import React, { useEffect, useState } from 'react'
-import { supabase } from '../lib/supabase'
-import { Card, SectionHead, Spinner, Empty, PageTitle, TableWrap, Th, Td, Badge, Meter, Stat } from '../ui.jsx'
-import { money, fmtDate, isOverdue } from '../lib/helpers'
+import React, { useEffect, useMemo, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
+import { useApp } from '../App.jsx'
+import { Card, SectionHead, Btn, Input, Select, Spinner, Empty, PageTitle, Alert, Tabs, TableWrap, Th, Td } from '../ui.jsx'
+import { Chart } from '../lib/charts.jsx'
+import { fmtCell } from '../lib/reportExport'
+import { loadReportData, performanceScope, overviewReport, contractReport, teamsReport, engineersReport, partsReport } from '../lib/reportData'
+
+const NUMERIC = ['money', 'num', 'int', 'pct', 'days']
+const PAGE = 25
+
+export function ExportButtons({ build, meta, disabled }) {
+  const [busy, setBusy] = useState('')
+  const [err, setErr] = useState('')
+  const run = async (kind) => {
+    setBusy(kind); setErr('')
+    try {
+      const report = await build()
+      if (!report) throw new Error('Nothing to export')
+      const m = await import('../lib/reportExport')
+      await (kind === 'pdf' ? m.exportReportPdf : m.exportReportExcel)(report, meta)
+    } catch (ex) { setErr(`Could not build the ${kind === 'pdf' ? 'PDF' : 'Excel file'}: ${ex.message}`) }
+    setBusy('')
+  }
+  return (
+    <>
+      <Btn variant="secondary" icon="download" onClick={() => run('xlsx')} disabled={!!busy || disabled}>{busy === 'xlsx' ? 'Exporting…' : 'Excel'}</Btn>
+      <Btn variant="secondary" icon="download" onClick={() => run('pdf')} disabled={!!busy || disabled}>{busy === 'pdf' ? 'Exporting…' : 'PDF'}</Btn>
+      {err && <span role="alert" className="basis-full text-right text-[13px] text-brand-700">{err}</span>}
+    </>
+  )
+}
+
+function ReportTable({ table }) {
+  const [all, setAll] = useState(false)
+  const rows = all ? table.rows : table.rows.slice(0, PAGE)
+  const totals = table.columns.some(c => c.sum) && table.rows.length > 1
+  return (
+    <Card className="overflow-hidden mb-6">
+      <SectionHead title={table.title} hint={`${table.rows.length} row${table.rows.length === 1 ? '' : 's'}`} />
+      {table.rows.length === 0 ? <Empty title="Nothing in this period" /> : (
+        <TableWrap>
+          <thead><tr>{table.columns.map(c => <Th key={c.k} right={NUMERIC.includes(c.t)}>{c.h}</Th>)}</tr></thead>
+          <tbody>
+            {rows.map((r, i) => (
+              <tr key={i}>{table.columns.map((c, j) => (
+                <Td key={c.k} right={NUMERIC.includes(c.t)}
+                  className={`${NUMERIC.includes(c.t) || c.t === 'date' ? 'num text-[13px] whitespace-nowrap' : ''} ${j === 0 ? 'font-medium text-ink-900 whitespace-nowrap' : ''} ${(c.w || 0) >= 36 ? 'min-w-[240px]' : ''}`}>
+                  {fmtCell(r[c.k], c.t)}
+                </Td>
+              ))}</tr>
+            ))}
+            {totals && (
+              <tr className="bg-ink-50 font-medium text-ink-900">{table.columns.map((c, j) => (
+                <Td key={c.k} right={NUMERIC.includes(c.t)} className="num text-[13px] border-t border-ink-300">
+                  {c.sum ? fmtCell(table.rows.reduce((s, r) => s + Number(r[c.k] || 0), 0), c.t) : j === 0 ? 'Total' : ''}
+                </Td>
+              ))}</tr>
+            )}
+          </tbody>
+        </TableWrap>
+      )}
+      {table.rows.length > PAGE && (
+        <div className="px-5 py-3 border-t border-ink-100 text-[13px] text-ink-500 flex items-center justify-between gap-3">
+          <span>{all ? `All ${table.rows.length} rows` : `First ${PAGE} of ${table.rows.length} rows. The Excel and PDF files include every row.`}</span>
+          <Btn size="sm" variant="ghost" onClick={() => setAll(a => !a)}>{all ? 'Show fewer' : 'Show all'}</Btn>
+        </div>
+      )}
+    </Card>
+  )
+}
+
+export function ReportView({ report }) {
+  if (!report) return <Empty icon="search" title="Nothing to report" hint="Pick another item or widen the period." />
+  const charts = report.charts.filter(c => c && (c.spec.rows?.length || c.spec.points?.length))
+  return (
+    <div>
+      <dl className="grid grid-cols-2 lg:grid-cols-4 2xl:grid-cols-6 gap-3 mb-6">
+        {report.kpis.map(k => (
+          <div key={k.label} className="bg-white rounded-xl border border-ink-200 shadow-card px-4 py-3.5">
+            <dt className="text-[11px] font-medium uppercase tracking-[0.080em] text-ink-500 leading-snug">{k.label}</dt>
+            <dd className={`num font-medium mt-1.5 break-words ${String(k.value).length > 16 ? 'text-[15px] leading-snug' : 'text-[22px] leading-tight'} ${k.alert ? 'text-brand-600' : 'text-ink-900'}`}>{k.value}</dd>
+          </div>
+        ))}
+      </dl>
+      {charts.length > 0 && (
+        <div className="grid lg:grid-cols-2 gap-4 sm:gap-6 mb-6">
+          {charts.map(c => (
+            <Card key={c.title} className="overflow-hidden">
+              <SectionHead title={c.title} hint={c.note} />
+              <div className="px-5 py-4"><Chart spec={c.spec} label={c.title} /></div>
+            </Card>
+          ))}
+        </div>
+      )}
+      {report.tables.map(t => <ReportTable key={t.title} table={t} />)}
+    </div>
+  )
+}
 
 export default function Reports() {
+  const { profile, settings } = useApp()
+  const [params, setParams] = useSearchParams()
   const [data, setData] = useState(null)
+  const [err, setErr] = useState('')
+  const [f, setF] = useState({ from: '', to: '' })
+  const role = profile.role
+  const wide = ['admin', 'clinical_engineer'].includes(role)
+  const tabs = [
+    { key: 'overview', label: 'All contracts' }, { key: 'contract', label: 'By contract' },
+    ...(role === 'engineer' ? [] : [{ key: 'teams', label: wide ? 'Teams' : 'My team' }]),
+    { key: 'engineers', label: role === 'engineer' ? 'My report' : 'Engineers' }, { key: 'parts', label: 'Parts' },
+  ]
+  const tab = tabs.some(t => t.key === params.get('tab')) ? params.get('tab') : 'overview'
+  const id = params.get('id') || ''
+  const part = params.get('part') || ''
+  const go = (patch) => { const p = { tab, id, part, ...patch }; setParams(Object.fromEntries(Object.entries(p).filter(([, v]) => v)), { replace: true }) }
 
-  useEffect(() => {
-    (async () => {
-      const [{ data: bals }, { data: contracts }, { data: reqs }] = await Promise.all([
-        supabase.from('contract_balances').select('*'),
-        supabase.from('contracts').select('*, vendors(name)'),
-        supabase.from('requests').select('*, request_items(*), supervisor:profiles!requests_supervisor_id_fkey(full_name), contracts(contract_number, vendor_id, vendors(name))'),
-      ])
-      setData({ bals: bals || [], contracts: contracts || [], reqs: reqs || [] })
-    })()
-  }, [])
+  useEffect(() => { loadReportData().then(setData).catch(ex => setErr(ex.message)) }, [])
 
+  const scope = useMemo(() => data ? performanceScope(data.requests, profile) : [], [data, profile])
+  const people = useMemo(() => {
+    const uniq = (pick) => [...new Map(scope.map(pick).filter(x => x?.id).map(x => [x.id, x])).values()].sort((a, b) => a.full_name.localeCompare(b.full_name))
+    return { engineers: uniq(r => r.engineer), supervisors: uniq(r => r.supervisor) }
+  }, [scope])
+  const partOptions = useMemo(() => {
+    if (!data) return []
+    const m = new Map()
+    for (const r of data.requests) if (!id || String(r.contract_id) === id) for (const i of r.parts) if (!m.has(i.part_number)) m.set(i.part_number, i.description)
+    return [...m].sort((a, b) => a[1].localeCompare(b[1]))
+  }, [data, id])
+
+  const report = useMemo(() => {
+    if (!data) return null
+    if (tab === 'overview') return overviewReport(data, f)
+    if (tab === 'contract') return contractReport(data, f, id || data.contracts[0]?.id)
+    if (tab === 'teams') return teamsReport(data, f, scope, wide ? id : profile.id)
+    if (tab === 'engineers') return engineersReport(data, f, scope, role === 'engineer' ? profile.id : id)
+    return partsReport(data, f, id, part)
+  }, [data, f, tab, id, part, scope, wide, role, profile.id])
+
+  if (err) return <Alert>Could not load the report data: {err}</Alert>
   if (!data) return <Spinner />
-  const { bals, contracts, reqs } = data
-  const cById = Object.fromEntries(contracts.map(c => [c.id, c]))
-  const spent = reqs.filter(r => ['approved', 'closed'].includes(r.status))
-
-  // spend per vendor
-  const vendorSpend = {}
-  for (const r of spent) {
-    const vn = r.contracts?.vendors?.name || 'Unknown'
-    vendorSpend[vn] = (vendorSpend[vn] || 0) + r.request_items.reduce((s, i) => s + i.unit_price * i.quantity, 0)
-  }
-  const vendorRows = Object.entries(vendorSpend).sort((a, b) => b[1] - a[1])
-  const maxSpend = Math.max(1, ...vendorRows.map(v => v[1]))
-
-  // most requested parts
-  const parts = {}
-  for (const r of reqs) for (const i of r.request_items.filter(x => !x.is_vat)) {
-    const k = i.part_number
-    parts[k] = parts[k] || { part: i.part_number, desc: i.description, count: 0, qty: 0 }
-    parts[k].count += 1; parts[k].qty += i.quantity
-  }
-  const partRows = Object.values(parts).sort((a, b) => b.qty - a.qty).slice(0, 15)
-
-  // avg approval time per supervisor
-  const approvals = {}
-  for (const r of reqs.filter(x => x.decided_at)) {
-    const n = r.supervisor?.full_name || '—'
-    const hrs = (new Date(r.decided_at) - new Date(r.submitted_at)) / 3600000
-    approvals[n] = approvals[n] || { total: 0, count: 0 }
-    approvals[n].total += hrs; approvals[n].count += 1
-  }
-  const apprRows = Object.entries(approvals).map(([n, v]) => ({ n, avg: v.total / v.count, count: v.count }))
-
-  // overdue with no receipt
-  const overdue = reqs.filter(r => !r.archived && isOverdue(r))
-
-  const fmtHrs = h => h < 48 ? `${h.toFixed(1)} h` : `${(h / 24).toFixed(1)} days`
-
-  const totalValue = bals.reduce((s, b) => s + Number(b.total_amount), 0)
-  const totalRemaining = bals.reduce((s, b) => s + Number(b.remaining), 0)
-  const totalSpent = vendorRows.reduce((s, v) => s + v[1], 0)
-  const compact = (n) => Number(n).toLocaleString('en-US', { notation: 'compact', maximumFractionDigits: 1 })
+  const meta = { by: profile.full_name, department: settings.department_name }
 
   return (
-    <div className="space-y-6">
-      <PageTitle subtitle="Balances, spend and turnaround across all contracts you can see.">Reports</PageTitle>
+    <div>
+      <PageTitle subtitle="Balances, request activity and delivery performance. Every view exports to Excel or PDF with its charts."
+        right={<ExportButtons build={async () => report} meta={meta} disabled={!report} />}>Reports</PageTitle>
+      {!wide && <Alert kind="info">Request figures cover {role === 'supervisor' ? 'your team\'s requests' : 'your own requests'}. Contract balances are the full balances.</Alert>}
 
-      <div className="grid grid-cols-2 xl:grid-cols-4 gap-3 sm:gap-4">
-        <Stat label="Contracts" value={contracts.length} hint={`${compact(totalValue)} total value`} />
-        <Stat label="Remaining balance" value={compact(totalRemaining)} tone="olive" hint={totalValue ? `${Math.round(totalRemaining / totalValue * 100)}% of total value` : undefined} />
-        <Stat label="Approved spend" value={compact(totalSpent)} hint="Approved and closed requests" />
-        <Stat label="Overdue deliveries" value={overdue.length} tone={overdue.length ? 'brand' : 'ink'} hint="Past the vendor promise date" />
-      </div>
-
-      <Card className="overflow-hidden">
-        <SectionHead title="Balance by contract" />
-        {bals.length === 0 ? <Empty icon="contracts" title="No contracts yet" /> : (
-          <TableWrap>
-            <thead><tr><Th>Contract</Th><Th>Vendor</Th><Th right>Total</Th><Th right>Previously consumed</Th><Th right>Committed</Th><Th right>Remaining</Th><Th className="w-40">Balance left</Th><Th>End date</Th></tr></thead>
-            <tbody>
-              {bals.map(b => {
-                const c = cById[b.contract_id]
-                const pct = Number(b.total_amount) > 0 ? Number(b.remaining) / Number(b.total_amount) * 100 : 0
-                return (
-                  <tr key={b.contract_id}>
-                    <Td className="font-medium text-ink-900">{c?.contract_number}</Td>
-                    <Td>{c?.vendors?.name}</Td>
-                    <Td right className="num">{money(b.total_amount)}</Td>
-                    <Td right className="num text-ink-600">{money(b.previous_consumed_amount)}</Td>
-                    <Td right className="num text-ink-600">{money(b.approved_spend)}</Td>
-                    <Td right className={`num font-medium ${pct <= 10 ? 'text-brand-600' : 'text-ink-900'}`}>{money(b.remaining)}</Td>
-                    <Td><div className="flex items-center gap-3"><Meter pct={pct} className="flex-1" /><span className="num text-[12px] text-ink-600 w-9 text-right">{Math.round(pct)}%</span></div></Td>
-                    <Td className="text-[13px]">{fmtDate(c?.end_date)}</Td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </TableWrap>
-        )}
-      </Card>
-
-      <div className="grid lg:grid-cols-2 gap-6 items-start">
-        <Card className="overflow-hidden">
-          <SectionHead title="Spend by vendor" hint="Approved and closed requests" />
-          {vendorRows.length === 0 ? <Empty icon="reports" title="No approved spend yet" /> : (
-            <ul className="p-5 space-y-4">
-              {vendorRows.map(([name, amt]) => (
-                <li key={name}>
-                  <div className="flex justify-between gap-3 text-sm mb-1.5"><span className="text-ink-900 truncate">{name}</span><span className="num font-medium text-ink-900">{money(amt)}</span></div>
-                  <div className="h-2 bg-ink-100 rounded-full overflow-hidden"><div className="h-full bg-ink-900 rounded-full" style={{ width: (amt / maxSpend * 100) + '%' }} /></div>
-                </li>
-              ))}
-            </ul>
+      <Card className="mb-6">
+        <Tabs className="px-2" value={tab} onChange={(k) => go({ tab: k, id: '', part: '' })} tabs={tabs} />
+        <div className="flex flex-wrap items-end gap-3 px-5 py-4">
+          {tab === 'contract' && (
+            <Select label="Contract" className="min-w-[240px]" value={id || data.contracts[0]?.id || ''} onChange={e => go({ id: e.target.value })}>
+              {data.contracts.map(c => <option key={c.id} value={c.id}>{c.contract_number} · {c.vendors?.name}</option>)}
+            </Select>
           )}
-        </Card>
-
-        <Card className="overflow-hidden">
-          <SectionHead title="Supervisor turnaround" hint="Average time from submission to decision" />
-          {apprRows.length === 0 ? <Empty icon="clock" title="No decided requests yet" /> : (
-            <TableWrap>
-              <thead><tr><Th>Supervisor</Th><Th right>Average time</Th><Th right>Decided</Th></tr></thead>
-              <tbody>
-                {apprRows.map(a => (
-                  <tr key={a.n}><Td className="text-ink-900">{a.n}</Td><Td right className="num font-medium text-ink-900">{fmtHrs(a.avg)}</Td><Td right className="num">{a.count}</Td></tr>
-                ))}
-              </tbody>
-            </TableWrap>
+          {tab === 'teams' && wide && (
+            <Select label="Team" className="min-w-[240px]" value={id} onChange={e => go({ id: e.target.value })}>
+              <option value="">All teams</option>
+              {people.supervisors.map(p => <option key={p.id} value={p.id}>{p.full_name}</option>)}
+            </Select>
           )}
-        </Card>
-      </div>
-
-      <Card className="overflow-hidden">
-        <SectionHead title="Most requested parts" hint="Top 15 by quantity" />
-        {partRows.length === 0 ? <Empty icon="box" title="No requests yet" /> : (
-          <TableWrap>
-            <thead><tr><Th>Part number</Th><Th>Description</Th><Th right>Times requested</Th><Th right>Total quantity</Th></tr></thead>
-            <tbody>
-              {partRows.map(p => (
-                <tr key={p.part}>
-                  <Td className="num text-[13px] text-ink-900">{p.part}</Td>
-                  <Td className="max-w-[420px]">{p.desc}</Td>
-                  <Td right className="num">{p.count}</Td><Td right className="num font-medium text-ink-900">{p.qty}</Td>
-                </tr>
-              ))}
-            </tbody>
-          </TableWrap>
-        )}
+          {tab === 'engineers' && role !== 'engineer' && (
+            <Select label="Engineer" className="min-w-[240px]" value={id} onChange={e => go({ id: e.target.value })}>
+              <option value="">All engineers</option>
+              {people.engineers.map(p => <option key={p.id} value={p.id}>{p.full_name}</option>)}
+            </Select>
+          )}
+          {tab === 'parts' && <>
+            <Select label="Contract" className="min-w-[220px]" value={id} onChange={e => go({ id: e.target.value, part: '' })}>
+              <option value="">All contracts</option>
+              {data.contracts.map(c => <option key={c.id} value={c.id}>{c.contract_number} · {c.vendors?.name}</option>)}
+            </Select>
+            <Select label="Part" className="min-w-[260px] max-w-sm" value={part} onChange={e => go({ part: e.target.value })}>
+              <option value="">All parts</option>
+              {partOptions.map(([pn, d]) => <option key={pn} value={pn}>{d} · {pn}</option>)}
+            </Select>
+          </>}
+          <Input label="Submitted from" type="date" value={f.from} max={f.to || undefined} onChange={e => setF(x => ({ ...x, from: e.target.value }))} />
+          <Input label="Submitted to" type="date" value={f.to} min={f.from || undefined} onChange={e => setF(x => ({ ...x, to: e.target.value }))} />
+          {(f.from || f.to) && <Btn variant="ghost" onClick={() => setF({ from: '', to: '' })}>All dates</Btn>}
+        </div>
       </Card>
 
-      <Card className="overflow-hidden">
-        <SectionHead title="Overdue deliveries" hint="Promise date has passed and parts are still outstanding" />
-        {overdue.length === 0 ? <Empty icon="check" title="Nothing is overdue" /> : (
-          <TableWrap>
-            <thead><tr><Th>Request</Th><Th>Contract</Th><Th>Promise date</Th><Th>Last follow-up</Th><Th>Outstanding</Th></tr></thead>
-            <tbody>
-              {overdue.map(r => (
-                <tr key={r.id}>
-                  <Td className="num font-medium text-ink-900">{r.request_number}</Td>
-                  <Td>{r.contracts?.contract_number}</Td>
-                  <Td className="text-brand-700 font-medium">{fmtDate(r.promise_date)}</Td>
-                  <Td>{fmtDate(r.last_followup_date)}</Td>
-                  <Td><Badge className="bg-brand-100 text-brand-700">{r.request_items.filter(i => (i.received_quantity || 0) < i.quantity).length} lines outstanding</Badge></Td>
-                </tr>
-              ))}
-            </tbody>
-          </TableWrap>
-        )}
-      </Card>
+      {report && <div className="mb-5"><h2 className="font-display text-xl font-medium text-ink-900">{report.title}</h2><p className="text-sm text-ink-500 mt-1">{report.subtitle}</p></div>}
+      <ReportView report={report} />
     </div>
   )
 }

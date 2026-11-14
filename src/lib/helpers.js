@@ -191,7 +191,8 @@ export function buildApprovalEmail(req, settings = {}) {
 const encHeader = (v) => '=?UTF-8?B?' + btoa(String.fromCharCode(...new TextEncoder().encode(v))) + '?='
 
 // Saves a ready-to-send Outlook message (.eml) with a plain-text and an HTML version.
-export function downloadEml({ to = [], cc = '', subject, body, html, filename }) {
+export function downloadEml({ to = [], cc = [], subject, body, html, filename }) {
+  cc = (Array.isArray(cc) ? cc : [cc]).filter(Boolean).join(', ')
   const boundary = '----=_DCS_' + Date.now()
   const eml = [
     `To: ${to.join(', ')}`, ...(cc ? [`Cc: ${cc}`] : []), `Subject: ${encHeader(subject)}`, 'X-Unsent: 1', 'MIME-Version: 1.0',
